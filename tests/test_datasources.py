@@ -305,3 +305,22 @@ def test_smoothing_preserves_total_signal() -> None:
     )
     assert smoothed.loc[50] < 1.0
     assert smoothed.sum() == pytest.approx(utilities.gaussian_kernel(2).sum())
+
+
+@pytest.mark.parametrize(
+    "tag_text",
+    [
+        "\tchr1\t101\t0\t1.0\t10\n\tchr1\t501\t0\t1.0\t10\n",
+        "chr1\t101\t0\t1.0\t10\nchr1\t501\t0\t1.0\t10\n\n",
+    ],
+    ids=["leading-tab", "trailing-blank-line"],
+)
+def test_tag_directory_tolerates_whitespace(tmp_path: Path, tag_text: str, alarm: None) -> None:
+    """Lines are stripped before splitting and blank lines are skipped, as before."""
+    tag_directory_path = tmp_path / "tags"
+    tag_directory_path.mkdir()
+    (tag_directory_path / "chr1.tags.tsv").write_text(tag_text)
+    tags = datasources.TagDirectory(tag_directory_path, None)
+    assert tags.query("chr1", 90, 600).sum() == 20.0
+    assert tags.query("chr1", 400, 600).sum() == 10.0
+    assert tags.query("chr1", 600, 700).sum() == 0.0

@@ -1,5 +1,6 @@
 """Tests for pygbrowse.plots: rendering through GenomeBrowser.visualize on synthetic data."""
 
+import contextlib
 from pathlib import Path
 
 import matplotlib
@@ -143,7 +144,13 @@ def test_hic_plot_leaves_source_matrix_unchanged() -> None:
 
 def test_hic_plot_under_copy_on_write() -> None:
     """HicPlot renders with pandas Copy-on-Write enabled."""
-    with pandas.option_context("mode.copy_on_write", True):
+    # Copy-on-Write is always on from pandas 3; the option only exists before that.
+    copy_on_write = (
+        contextlib.nullcontext()
+        if int(pandas.__version__.split(".")[0]) >= 3
+        else pandas.option_context("mode.copy_on_write", True)
+    )
+    with copy_on_write:
         track = plots.HicPlot(datasources.HicDataDict({"chr1": hic_matrix()}, 10))
         render(track, "chr1", 100, 300)
 
@@ -200,3 +207,10 @@ def test_every_track_type_renders(
     png_fpath = tmp_path / "browser.png"
     figure.savefig(png_fpath)
     assert png_fpath.stat().st_size > 0
+
+
+def test_single_row_height_list_applies_to_every_row() -> None:
+    """row_heights=[h] is used for every row, as a scalar is."""
+    track = plots.BedPlot(datasources.IntervalData(interval_frame()))
+    figure = plots.GenomeBrowser([[track], [track]]).visualize("chr1", 0, 1000, row_heights=[2])
+    assert len(figure.axes) == 2

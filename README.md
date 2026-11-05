@@ -51,6 +51,8 @@ call `logging.basicConfig(level=logging.INFO)`.
 
 - Every `query(chrom, start, end)` and every `visualize(chrom, start, end)` window is
   **0-based, half-open** (`[start, end)`), as in BED.
+  Two exceptions: Hi-C queries round both ends to bins and include both end bins, and
+  `SparseVectors` also returns the nearest point outside the window on each side.
 - Query chromosomes are UCSC style (`chr1`, `chrX`, `chrM`). Sources convert to the file's
   naming: `Gff3Annotations` expects Ensembl contigs (`1`, `X`, `MT`) by default, and
   `BigWigDataSource(chromosome_dialect=...)` accepts `ucsc`, `ensembl` or `yeast`.

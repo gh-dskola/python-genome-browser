@@ -65,10 +65,29 @@ listed under a `### Breaking changes` heading with a *Migration:* note.
   *Migration:* configure `logging` (e.g. `logging.basicConfig(level=logging.INFO)`) to see
   messages; use `numpy.diag_indices`/`numpy.indices` for diagonals.
 
+- **`WigPlot(data=...)` needs a data source with `query()`**; a plain dict of Series no longer
+  works. *Migration:* wrap it: `WigPlot(data=SparseVectors(series_dict))`.
+- **`ax_spacing` is a fraction of the summed row heights for the gaps too** (it was used as a
+  figure fraction), so every multi-row figure's gaps shrink slightly (3 rows at 0.05: gap
+  0.0435 instead of 0.05). *Migration:* raise `ax_spacing` to restore the old look.
+- **More moved, removed and retyped names.**
+  *Migration:* use the new location or drop the reference:
+  - `plots.DEFAULT_ARC_POINTS`, `plots.compute_half_arc_points` → `pygbrowse._arcs`.
+  - Removed: `plots.CHROMOSOME_DIALECT`, `GenomeBrowser.VECTOR_LEGEND_LOC`,
+    `BedPlot.CHROM_COL_NUM`/`START_COL_NUM`/`END_COL_NUM`, `TagDirectory.tag_strand_translator`,
+    the `romannumerals` module.
+  - Attribute `HicDataDir.fname_template` → `fpath_template`.
+  - `Gff3Annotations.gff3_fpath`, `BigWigDataSource.bigwig_fpath` and
+    `TagDirectory.tag_directory_path` are `pathlib.Path`, not `str`.
+  - `BedPlot` and `GenomeBrowser.visualize` raise `ValueError` where they used `assert`.
+
 These breaking changes ship as 0.4.0.
 
 ### Changed
 
+- `GeneModelPlot` reaches exons only through gene → transcript → component, so a
+  transcript whose type is not in `Gff3Annotations(transcript_types=...)` draws no exons
+  (orphans are logged); widen `transcript_types` if exons are missing.
 - Base classes use `abc.ABC`; `HicPlot` is a `_BrowserSubPlot`.
 - Messages go through `logging.getLogger(__name__)` instead of `print`.
 - Type hints and numpy-style docstrings on the public API; the coordinate convention is
@@ -87,6 +106,7 @@ These breaking changes ship as 0.4.0.
 - `GeneModelPlot` draws only each gene's own UTRs and CDSs (it drew every overlapping
   gene's components on every row), lays out only the genes in `genes_include`, and sizes
   + strand 3' UTRs in data units.
+- `GeneModelPlot` UTR endcaps are no wider than the UTR (they overhung short UTRs).
 - `BedPlot` draws intervals that span the whole window, and `patch_kwargs` no longer
   change the class default.
 - `GenomeBrowser.visualize` returns a new figure on every call.

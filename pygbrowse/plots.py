@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_YLABEL_PAD = 50
 
-# Track style, formerly applied globally through seaborn.set_style("ticks").
+# Track style, formerly applied globally through seaborn.set_style("ticks"). seaborn's font
+# settings are left out: fonts resolve when the figure is drawn, after the rc_context exits.
 DEFAULT_STYLE = {
     "figure.facecolor": "white",
     "axes.labelcolor": ".15",
@@ -39,14 +40,6 @@ DEFAULT_STYLE = {
     "axes.axisbelow": True,
     "grid.linestyle": "-",
     "text.color": ".15",
-    "font.family": ["sans-serif"],
-    "font.sans-serif": [
-        "Arial",
-        "DejaVu Sans",
-        "Liberation Sans",
-        "Bitstream Vera Sans",
-        "sans-serif",
-    ],
     "lines.solid_capstyle": "round",
     "patch.edgecolor": "w",
     "patch.force_edgecolor": True,
@@ -758,13 +751,16 @@ class GenomeBrowser:
         fig_width : float
             Figure width in inches.
         row_heights : float or sequence of float
-            Row height in inches, one value for all rows or one per row.
+            Row height in inches: one value (or a one-element list) for all rows, or one per
+            row.
         ax_spacing : float
             Gap below each row, as a fraction of the summed row heights.
         num_xticks : int
             Approximate number of x ticks on the bottom row.
         style : dict, optional
-            matplotlib rcParams that override ``DEFAULT_STYLE`` for this figure only.
+            matplotlib rcParams that override ``DEFAULT_STYLE`` for this figure only. Settings
+            read at draw time (e.g. ``font.*``) do not apply once ``visualize`` returns; wrap
+            the ``savefig`` call in ``matplotlib.rc_context`` for those.
 
         Returns
         -------
@@ -780,7 +776,9 @@ class GenomeBrowser:
         if end <= start:
             raise ValueError(f"Window end must be greater than window start; got {start}, {end}")
         if numpy.ndim(row_heights) == 0:
-            row_heights = [row_heights] * len(self.subplot_objects)
+            row_heights = [row_heights]
+        if len(row_heights) == 1:
+            row_heights = list(row_heights) * len(self.subplot_objects)
         if len(row_heights) != len(self.subplot_objects):
             raise ValueError(
                 f"Got {len(row_heights)} row heights for {len(self.subplot_objects)} rows"

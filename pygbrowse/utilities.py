@@ -97,7 +97,8 @@ def binary_search_tag_file(tag_fpath: str | Path, search_target: int) -> int | N
     Parameters
     ----------
     tag_fpath : str or Path
-        HOMER ``<chrom>.tags.tsv`` file, sorted by start. Column 2 holds the 1-based start.
+        HOMER ``<chrom>.tags.tsv`` file, sorted by start. After stripping, field 2 holds
+        the 1-based start; blank lines are skipped.
     search_target : int
         1-based position to search for.
 
@@ -110,17 +111,20 @@ def binary_search_tag_file(tag_fpath: str | Path, search_target: int) -> int | N
     with open(tag_fpath, "rb") as tag_file:
 
         def first_line_from(offset: int) -> tuple[int, bytes]:
-            """Return the offset and content of the first line starting at or after offset."""
+            """Return the offset and content of the first non-blank line at or after offset."""
             tag_file.seek(max(offset - 1, 0))
             if offset > 0:
                 tag_file.readline()
-            return tag_file.tell(), tag_file.readline()
+            while True:
+                line_offset, line = tag_file.tell(), tag_file.readline()
+                if not line or line.strip():
+                    return line_offset, line
 
         low, high = 0, os.path.getsize(tag_fpath)
         while low < high:
             middle = (low + high) // 2
             _, line = first_line_from(middle)
-            if not line or int(line.split(b"\t")[1]) >= search_target:
+            if not line or int(line.split()[1]) >= search_target:
                 high = middle
             else:
                 low = middle + 1

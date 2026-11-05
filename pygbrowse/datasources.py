@@ -7,6 +7,10 @@ file's own chromosome naming and coordinate system internally:
 - GFF3 (1-based, closed) is converted in ``Gff3Annotations``.
 - HOMER tag files (1-based starts) are converted in ``TagDirectory``.
 - BED and BigWig are already 0-based, half-open.
+
+Exceptions: Hi-C matrix queries (``HicDataDir``, ``HicDataDict``) round both ends to bins
+and include both end bins. ``SparseVectors`` also returns the nearest point outside the
+window on each side.
 """
 
 import abc
@@ -171,8 +175,8 @@ class TagDirectory(_VectorDataSource):
     ):
         """Read coverage from a HOMER tag directory (``<chrom>.tags.tsv`` + ``tagInfo.txt``).
 
-        Tag files are read in the column layout chrom, 1-based start, strand, depth,
-        read length. Strand is ignored.
+        Tag lines are stripped and split on whitespace into chrom, 1-based start, strand,
+        depth, read length; blank lines are skipped. Strand is ignored.
 
         Parameters
         ----------
@@ -219,7 +223,7 @@ class TagDirectory(_VectorDataSource):
     def _query(self, chrom, start, end):
         coverage = numpy.zeros(end - start)
         tag_fpath = self.tag_directory_path / f"{chrom}.tags.tsv"
-        # HOMER tag starts are 1-based: the 0-based start is 1-based start + 1.
+        # HOMER tag starts are 1-based: 0-based position `start` is 1-based position start + 1.
         start_offset = utilities.binary_search_tag_file(tag_fpath, start + 1)
 
         if start_offset is not None:
@@ -228,7 +232,9 @@ class TagDirectory(_VectorDataSource):
                 # ponytail: reads starting left of the window are not seen; seeking back by the
                 # maximum read length would catch reads that overhang into the window.
                 for line in tag_file:
-                    fields = line.split(b"\t")
+                    fields = line.split()
+                    if not fields:
+                        continue
                     # HOMER tag starts are 1-based; -1 gives the 0-based start.
                     read_start = int(fields[1]) - 1
                     if read_start >= end:
@@ -542,6 +548,9 @@ class Gff3Annotations(_GeneModels):
             Column-2 sources to keep.
         gene_types, transcript_types, component_types : tuple of str
             Column-3 feature types treated as genes, transcripts and drawn components.
+            A component is linked to a gene only through a parent transcript whose type
+            is in ``transcript_types``; others are logged as orphans and not drawn. Add
+            the file's transcript types here if exons are missing.
         """
         self.gff3_fpath = Path(gff3_fpath)
         self.tabix_file = pysam.TabixFile(str(gff3_fpath))
