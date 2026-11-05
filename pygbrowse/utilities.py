@@ -5,7 +5,6 @@ import subprocess
 import numpy
 from scipy.stats import norm
 
-from . import romannumerals
 
 # ToDo: Bring back scale bar
 # ToDo: Add option for solid fill of vectors
@@ -18,45 +17,47 @@ def roundto(num, nearest):
     return int((num + (nearest / 2)) // nearest * nearest)
 
 
-def convert_chromosome_name(chrom_string, dialect="ucsc"):
+YEAST_ROMAN_NUMERALS = {
+    str(number): numeral
+    for number, numeral in enumerate(
+        ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV",
+         "XV", "XVI"],
+        start=1,
+    )
+}
+UCSC_MITOCHONDRIAL_ALIASES = {"M", "MT", "dmel_mitochondrion_genome"}
+
+
+def convert_chromosome_name(chrom_string: str, dialect: str = "ucsc") -> str:
+    """Convert a chromosome name to the given naming dialect.
+
+    Parameters
+    ----------
+    chrom_string : str
+        Chromosome name in any dialect, e.g. ``chr1``, ``1``, ``chrX``, ``MT``, ``XI``.
+    dialect : str
+        ``ucsc`` (``chr1``, ``chrX``, ``chrM``), ``ensembl`` (``1``, ``X``, ``MT``) or
+        ``yeast`` (Roman numerals ``I`` to ``XVI``). Roman numerals are only produced for
+        ``yeast``; other dialects keep ``X``, ``V`` etc. as letters.
+
+    Returns
+    -------
+    str
+        The chromosome name in the requested dialect.
+
+    Raises
+    ------
+    ValueError
+        If ``dialect`` is not one of the three above.
     """
-    Try to auto-detect chromosome number and convert it to the specified "dialect".
-
-    Valid dialects are "ucsc", "ensembl" and "yeast".
-
-    :param chrom_string:
-    :param source:
-    :param dest:
-    :return:
-    """
-    try:
-        chrom_string = str(romannumerals.roman_to_int(chrom_string))
-    except ValueError:
-        pass
-
+    bare_name = chrom_string[3:] if chrom_string[:3].lower() == "chr" else chrom_string
+    if dialect == "ucsc":
+        return "chrM" if bare_name in UCSC_MITOCHONDRIAL_ALIASES else f"chr{bare_name}"
     if dialect == "ensembl":
-        if chrom_string == "chrM":
-            return "dmel_mitochonrdion_genome"
-        elif chrom_string[:3].lower() == "chr":
-            return chrom_string[3:]
-        else:
-            return chrom_string
-    elif dialect == "ucsc":
-        if chrom_string == "dmel_mitochondrion_genome":
-            return "chrM"
-        elif chrom_string[:3].lower() == "chr":
-            return chrom_string
-        else:
-            return "chr{}".format(chrom_string)
-    elif dialect == "yeast":
-        if chrom_string[:3].lower() == "chr":
-            chrom_string = chrom_string[3:]
-        try:
-            return romannumerals.int_to_roman(int(chrom_string))
-        except ValueError:
-            return chrom_string
-    else:
-        raise ValueError("Unknown dialect {}".format(dialect))
+        return "MT" if bare_name == "M" else bare_name
+    if dialect == "yeast":
+        return YEAST_ROMAN_NUMERALS.get(bare_name, bare_name)
+    raise ValueError(f"Unknown dialect {dialect!r}; expected 'ucsc', 'ensembl' or 'yeast'")
 
 
 def binary_search_tag_file(tag_filename, search_target):

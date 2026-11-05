@@ -20,8 +20,16 @@ listed under a `### Breaking changes` heading with a *Migration:* note.
   `.pre-commit-config.yaml`.
 - Docs: `CLAUDE.md`, `CONTRIBUTING.md`, `PAPERCUTS.md`.
 
+### Fixed
+
+- `convert_chromosome_name` no longer reads `X`, `V`, `XI` etc. as Roman numerals outside
+  the `yeast` dialect (`X` → `chr10` before); `chrM` ↔ `MT` replaces a misspelled Drosophila
+  name.
+- Tracks no longer fall off the bottom of the figure at six or more rows.
+
 ### Removed
 
+- `romannumerals.py`; `yeast` conversion uses a 16-entry table.
 - `setup.py` and `build_and_upload.sh` (no PyPI publishing).
 
 ## [0.3.3] - 2018-10-12

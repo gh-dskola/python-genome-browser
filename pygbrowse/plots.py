@@ -827,23 +827,51 @@ class GeneModelPlot(_BrowserSubPlot):
         ax.set_ylabel(self.label)
 
 
-def compute_ax_row_positions(row_heights, ax_spacing=0.1):
+def compute_figure_height(row_heights: list[float], ax_spacing: float) -> float:
+    """Return the figure height in inches for the given rows and spacing.
+
+    Parameters
+    ----------
+    row_heights : list of float
+        Height of each row, in inches.
+    ax_spacing : float
+        Gap below each row, as a fraction of the summed row heights.
+
+    Returns
+    -------
+    float
+        Figure height in inches.
     """
-    Given a sequence of row heights (in inches), and the size of the space to put between
-    axes (in fractions of total row height), returns a list of bottom coordinates
-    and heights for each row, suitable for passing to the fig.add_ax() method.
+    return float(numpy.sum(row_heights)) * (1 + ax_spacing * len(row_heights))
+
+
+def compute_ax_row_positions(
+    row_heights: list[float], ax_spacing: float = 0.1
+) -> tuple[list[float], list[float]]:
+    """Lay out rows top to bottom in figure coordinates.
+
+    Parameters
+    ----------
+    row_heights : list of float
+        Height of each row, in inches.
+    ax_spacing : float
+        Gap below each row, as a fraction of the summed row heights. Converted to figure
+        coordinates with the same figure height that ``compute_figure_height`` returns.
+
+    Returns
+    -------
+    tuple of (list of float, list of float)
+        Bottom coordinate and height of each row, in figure coordinates in [0, 1], suitable
+        for ``Figure.add_axes``.
     """
+    fig_height = compute_figure_height(row_heights=row_heights, ax_spacing=ax_spacing)
+    gap_height = ax_spacing * float(numpy.sum(row_heights)) / fig_height
+    heights = [row_height / fig_height for row_height in row_heights]
     bottoms = []
-    heights = []
-    total_canvas_height = numpy.sum(row_heights)
-    fig_height = total_canvas_height * (1 + ax_spacing * len(row_heights))
-    cur_vertical_pos = 1
-    for row_idx in range(len(row_heights)):
-        this_row_height = row_heights[row_idx] / fig_height
-        cur_vertical_pos -= this_row_height
-        heights.append(this_row_height)
-        bottoms.append(cur_vertical_pos)
-        cur_vertical_pos -= ax_spacing
+    current_top = 1.0
+    for height in heights:
+        bottoms.append(current_top - height)
+        current_top -= height + gap_height
     return bottoms, heights
 
 
@@ -925,7 +953,7 @@ class GenomeBrowser:
             len(self.subplot_objects),
             figsize=(
                 fig_width,
-                numpy.sum(row_heights) * (1 + ax_spacing * len(self.subplot_objects)),
+                compute_figure_height(row_heights=row_heights, ax_spacing=ax_spacing),
             ),
         )
         bottoms, heights = compute_ax_row_positions(row_heights=row_heights, ax_spacing=ax_spacing)
