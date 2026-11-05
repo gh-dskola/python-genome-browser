@@ -47,7 +47,7 @@ def int_to_roman(input):
     if not 0 < input < 4000:
         raise ValueError("Argument must be between 1 and 3999")
     ints = (1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1)
-    nums = ('M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I')
+    nums = ("M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I")
     result = ""
     for i in range(len(ints)):
         count = int(input / ints[i])
@@ -86,7 +86,7 @@ def roman_to_int(input):
     if type(input) != type(""):
         raise TypeError("expected string, got %s" % type(input))
     input = input.upper()
-    nums = ['M', 'D', 'C', 'L', 'X', 'V', 'I']
+    nums = ["M", "D", "C", "L", "X", "V", "I"]
     ints = [1000, 500, 100, 50, 10, 5, 1]
     places = []
     for c in input:
@@ -105,9 +105,10 @@ def roman_to_int(input):
             pass
         places.append(value)
     sum = 0
-    for n in places: sum += n
+    for n in places:
+        sum += n
     # Easiest test for validity...
     if int_to_roman(sum) == input:
         return sum
     else:
-        raise ValueError('input is not a valid roman numeral: %s' % input)
+        raise ValueError("input is not a valid roman numeral: %s" % input)

@@ -56,8 +56,7 @@ def compute_interval_overlaps(A, B, min_overlap=0, is_sorted=False):
                 overlap_end = min(A[A_ptr][2], B[B_ptr][2])
                 #                 print('grabbing: {}, {}, {}, {} '.format(A_ptr, B_ptr, A[A_ptr], B[B_ptr]))
                 if overlap_end - overlap_start >= min_overlap:
-                    overlaps.append((A[A_ptr][0], B[B_ptr][0],
-                                     overlap_start, overlap_end))
+                    overlaps.append((A[A_ptr][0], B[B_ptr][0], overlap_start, overlap_end))
                 if B_ptr < len(B) - 1:
                     B_ptr += 1
                 #                     print('\tadvanced B: {}, {}, {}, {} '.format(A_ptr, B_ptr, A[A_ptr], B[B_ptr]))
@@ -69,6 +68,6 @@ def compute_interval_overlaps(A, B, min_overlap=0, is_sorted=False):
 
 
 def test():
-    test_A = [('A_1', 4, 8), ('A_2', 11, 19)]
-    test_B = [('B_1', 1, 6), ('B_2', 9, 10), ('B_3', 13, 15), ('B_4', 17, 20)]
+    test_A = [("A_1", 4, 8), ("A_2", 11, 19)]
+    test_B = [("B_1", 1, 6), ("B_2", 9, 10), ("B_3", 13, 15), ("B_4", 17, 20)]
     print(compute_interval_overlaps(test_A, test_B))
