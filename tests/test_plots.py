@@ -52,8 +52,9 @@ def interval_frame() -> pandas.DataFrame:
 def test_gene_components_drawn_once_per_gene(gff3_fpath: Path) -> None:
     """Each gene draws only its own components, so overlapping genes add no extra boxes."""
     ax = render(plots.GeneModelPlot(datasources.Gff3Annotations(gff3_fpath)), "chr1", 0, 1000)
-    assert len(rectangles(ax)) == EXPECTED_COMPONENT_RECTANGLES["GENEA"] + (
-        EXPECTED_COMPONENT_RECTANGLES["GENEB"]
+    assert (
+        len(rectangles(ax))
+        == EXPECTED_COMPONENT_RECTANGLES["GENEA"] + (EXPECTED_COMPONENT_RECTANGLES["GENEB"])
     )
 
 

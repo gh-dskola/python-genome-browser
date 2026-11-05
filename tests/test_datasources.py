@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy
 import pandas
 import pytest
-from conftest import BIGWIG_SIGNAL_END, BED_ROWS, write_gff3
+from conftest import BED_ROWS, BIGWIG_SIGNAL_END, write_gff3
 
 from pygbrowse import datasources, utilities
 
@@ -76,12 +76,12 @@ def test_tag_directory_read_starts(tag_directory_path: Path, alarm: None) -> Non
 @pytest.mark.parametrize(
     ("target", "expected_line"), [(50, 0), (101, 0), (102, 1), (106, 1), (107, 2), (501, 2)]
 )
-def test_binary_search_tag_file(
-    tag_directory_path: Path, target: int, expected_line: int
-) -> None:
+def test_binary_search_tag_file(tag_directory_path: Path, target: int, expected_line: int) -> None:
     """Returns the byte offset of the first tag whose 1-based start is >= target."""
     tag_fpath = tag_directory_path / "chr1.tags.tsv"
-    line_offsets = numpy.cumsum([0] + [len(line) for line in tag_fpath.read_bytes().splitlines(True)])
+    line_offsets = numpy.cumsum(
+        [0] + [len(line) for line in tag_fpath.read_bytes().splitlines(True)]
+    )
     assert utilities.binary_search_tag_file(tag_fpath, target) == line_offsets[expected_line]
 
 
@@ -134,9 +134,9 @@ def test_interval_data_unknown_format_raises(bed_fpath: Path) -> None:
 
 def test_gff3_hierarchy(gff3_fpath: Path) -> None:
     """Genes, transcripts and components link up, with 0-based half-open coordinates."""
-    genes, transcripts, components, names_to_ids = datasources.Gff3Annotations(
-        gff3_fpath
-    ).query("chr1", 0, 1000)
+    genes, transcripts, components, names_to_ids = datasources.Gff3Annotations(gff3_fpath).query(
+        "chr1", 0, 1000
+    )
     assert set(genes) == {"gene:GA", "gene:GB"}
     assert (genes["gene:GA"]["start"], genes["gene:GA"]["end"]) == (100, 600)
     assert genes["gene:GA"]["transcripts"] == ["transcript:TA"]

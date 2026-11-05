@@ -1,10 +1,25 @@
+"""Data sources that answer region queries for the browser tracks.
+
+Every data source has ``query(chrom, start, end)``. ``chrom`` is a UCSC-style name
+(``chr1``); ``start`` and ``end`` are **0-based, half-open**. Sources convert to the
+file's own chromosome naming and coordinate system internally:
+
+- GFF3 (1-based, closed) is converted in ``Gff3Annotations``.
+- HOMER tag files (1-based starts) are converted in ``TagDirectory``.
+- BED and BigWig are already 0-based, half-open.
+"""
+
+import abc
 import contextlib
 import logging
 import os
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from urllib.parse import unquote
 
 import numpy
 import pandas
+import pyBigWig
 import pysam
 from scipy.signal import convolve
 
@@ -37,55 +52,69 @@ DEFAULT_TRANSCRIPT_TYPES = (
     "snoRNA",
 )
 DEFAULT_COMPONENT_TYPES = ("CDS", "three_prime_UTR", "five_prime_UTR")
-# DEFAULT_MAXIMUM_TRANSCRIPT_SUPPORT = 5
+CHROMOSOME_DIALECTS = ("ucsc", "ensembl", "yeast")
 
-# ToDo: For each class, allow option of loading into memory or leaving on disk (where applicable)
-# ToDo: Add indexing of on-disk csv-like files
-# ToDo: Refactor vector data sources to transparently interpolate sparse vectors. Probably will have to drop dict-of-series interface.
+VectorTransform = Callable[[pandas.Series], pandas.Series]
 
 
 class _ChromWrapper:
-    def __init__(self, chrom, parent_data_source):
+    """``source[chrom].loc[start:end]`` indexing for vector data sources."""
+
+    def __init__(self, chrom: str, parent_data_source: "_VectorDataSource"):
         self.chrom = chrom
         self.parent_data_source = parent_data_source
 
-    def __getitem__(self, key):
-        # print(key)
-        # ToDo: Add support for step argument
-        try:  # See if key is a slice
-            query_start = key.start
-            query_end = key.stop
-        except TypeError:  # if not, treat as a scalar index
-            query_start = key
-            query_end = key + 1
-
-        return self.parent_data_source.query(
-            query_chrom=self.chrom, query_start=query_start, query_end=query_end
-        )
+    def __getitem__(self, key: slice | int) -> pandas.Series:
+        """Query a slice ``[start:end]`` (0-based half-open) or a single position."""
+        if isinstance(key, slice):
+            start, end = key.start, key.stop
+        else:
+            start, end = key, key + 1
+        return self.parent_data_source.query(self.chrom, start, end)
 
 
 class _DataVector:
-    def __init__(self, chrom, parent_data_source):
+    def __init__(self, chrom: str, parent_data_source: "_VectorDataSource"):
         self.loc = _ChromWrapper(chrom=chrom, parent_data_source=parent_data_source)
 
 
-class _VectorDataSource:
-    # ToDo: Add methods for arithmetic and such, as done for old Pileups class
-    def __init__(self, transform=None, smoothing_bandwidth=0):
+class _VectorDataSource(abc.ABC):
+    def __init__(self, transform: VectorTransform | None = None, smoothing_bandwidth: float = 0):
+        """Base class for per-base signal sources.
+
+        Parameters
+        ----------
+        transform : callable, optional
+            Applied to every query result, after smoothing.
+        smoothing_bandwidth : float
+            Standard deviation (bp) of a Gaussian smoothing kernel; 0 disables smoothing.
+        """
         self.transform = transform
         if smoothing_bandwidth:
             self.convolution_kernel = utilities.gaussian_kernel(smoothing_bandwidth)
         else:
             self.convolution_kernel = None
 
-    def _query(self, query_chrom, query_start, query_end):
-        print("Stub method -- must be overridden by inheritors")
+    @abc.abstractmethod
+    def _query(self, chrom: str, start: int, end: int) -> pandas.Series:
+        """Return the raw signal for a 0-based half-open region, indexed by position."""
 
-    def query(self, query_chrom, query_start, query_end):
-        query_result = self._query(
-            query_chrom=query_chrom, query_start=query_start, query_end=query_end
-        )
+    def query(self, chrom: str, start: int, end: int) -> pandas.Series:
+        """Return the smoothed, transformed signal for a region.
 
+        Parameters
+        ----------
+        chrom : str
+            Chromosome, UCSC style.
+        start, end : int
+            Region, 0-based half-open.
+
+        Returns
+        -------
+        pandas.Series
+            Signal values indexed by 0-based position.
+        """
+        query_result = self._query(chrom, start, end)
         if self.convolution_kernel is not None:
             query_result = pandas.Series(
                 convolve(query_result, self.convolution_kernel, mode="same"),
@@ -93,62 +122,105 @@ class _VectorDataSource:
             )
         if self.transform:
             query_result = self.transform(query_result)
-
         return query_result
 
-    def __getitem__(self, key):
-        return _DataVector(chrom=key, parent_data_source=self)
+    def __getitem__(self, chrom: str) -> _DataVector:
+        """Return an object whose ``.loc[start:end]`` queries ``chrom``."""
+        return _DataVector(chrom=chrom, parent_data_source=self)
 
 
 class SparseVectors(_VectorDataSource):
-    def __init__(self, series_dict, transform=None, convolution_kernel=None):
+    def __init__(
+        self,
+        series_dict: dict[str, pandas.Series],
+        transform: VectorTransform | None = None,
+        smoothing_bandwidth: float = 0,
+    ):
+        """Signal held in memory as one sparse Series per chromosome.
+
+        Parameters
+        ----------
+        series_dict : dict of str to pandas.Series
+            Per-chromosome values indexed by sorted 0-based position.
+        transform : callable, optional
+            Applied to every query result.
+        smoothing_bandwidth : float
+            Gaussian smoothing standard deviation in bp; 0 disables smoothing.
+        """
+        super().__init__(transform=transform, smoothing_bandwidth=smoothing_bandwidth)
         self.data = series_dict
-        self.transform = transform
-        self.convolution_kernel = convolution_kernel
 
-    def _query(self, query_chrom, query_start, query_end):
-        this_chrom_vector = self.data[query_chrom]
+    def _query(self, chrom, start, end):
+        this_chrom_vector = self.data[chrom]
         # One point either side of the window is kept so that line plots reach the edges.
-        start_ipos = max(numpy.searchsorted(this_chrom_vector.index, query_start) - 1, 0)
-        end_ipos = numpy.searchsorted(this_chrom_vector.index, query_end) + 1
-
+        start_ipos = max(numpy.searchsorted(this_chrom_vector.index, start) - 1, 0)
+        end_ipos = numpy.searchsorted(this_chrom_vector.index, end) + 1
         return this_chrom_vector.iloc[start_ipos:end_ipos]
 
 
 class TagDirectory(_VectorDataSource):
-    tag_strand_translator = {0: "+", 1: "-"}
     READ_HANDLING_MODES = ("reads", "starts")
 
     def __init__(
         self,
-        tag_directory_path,
-        normalize_to=DEFAULT_TAG_COUNT_NORMALIZATION_TARGET,
-        transform=None,
-        smoothing_bandwidth=0,
-        read_handling="reads",
+        tag_directory_path: str | Path,
+        normalize_to: float | None = DEFAULT_TAG_COUNT_NORMALIZATION_TARGET,
+        transform: VectorTransform | None = None,
+        smoothing_bandwidth: float = 0,
+        read_handling: str = "reads",
     ):
-        super().__init__(transform=transform, smoothing_bandwidth=smoothing_bandwidth)
+        """Read coverage from a HOMER tag directory (``<chrom>.tags.tsv`` + ``tagInfo.txt``).
 
+        Tag files are read in the column layout chrom, 1-based start, strand, depth,
+        read length. Strand is ignored.
+
+        Parameters
+        ----------
+        tag_directory_path : str or Path
+            HOMER tag directory.
+        normalize_to : float, optional
+            Scale depths so that the directory's total tag count equals this value.
+            ``None`` or 0 returns raw depths.
+        transform : callable, optional
+            Applied to every query result.
+        smoothing_bandwidth : float
+            Gaussian smoothing standard deviation in bp; 0 disables smoothing.
+        read_handling : str
+            ``reads`` spreads each tag over its read length; ``starts`` counts it once,
+            at its start.
+
+        Raises
+        ------
+        ValueError
+            If ``read_handling`` is not one of ``READ_HANDLING_MODES``.
+        """
+        super().__init__(transform=transform, smoothing_bandwidth=smoothing_bandwidth)
         if read_handling not in self.READ_HANDLING_MODES:
             raise ValueError(
                 f"read_handling must be one of {self.READ_HANDLING_MODES}, got {read_handling!r}"
             )
-        self.tag_directory_path = tag_directory_path
+        self.tag_directory_path = Path(tag_directory_path)
         self.read_handling = read_handling
         self.normalization_factor = 1.0
 
         if normalize_to:
-            tag_info_fpath = os.path.join(tag_directory_path, "tagInfo.txt")
+            tag_info_fpath = self.tag_directory_path / "tagInfo.txt"
             with open(tag_info_fpath) as tag_info_file:
-                sizeline = tag_info_file.readlines()[1].strip().split("\t")
-            num_tags = int(float(sizeline[2]))
+                size_fields = tag_info_file.readlines()[1].strip().split("\t")
+            num_tags = int(float(size_fields[2]))
             self.normalization_factor = normalize_to / num_tags
+            logger.info(
+                "Read %d total tags from %s; normalization factor %g",
+                num_tags,
+                tag_info_fpath,
+                self.normalization_factor,
+            )
 
-    def _query(self, query_chrom, query_start, query_end):
-        coverage = numpy.zeros(query_end - query_start)
-        tag_fpath = os.path.join(self.tag_directory_path, f"{query_chrom}.tags.tsv")
-        # HOMER tag starts are 1-based: the 0-based query_start is 1-based query_start + 1.
-        start_offset = utilities.binary_search_tag_file(tag_fpath, query_start + 1)
+    def _query(self, chrom, start, end):
+        coverage = numpy.zeros(end - start)
+        tag_fpath = self.tag_directory_path / f"{chrom}.tags.tsv"
+        # HOMER tag starts are 1-based: the 0-based start is 1-based start + 1.
+        start_offset = utilities.binary_search_tag_file(tag_fpath, start + 1)
 
         if start_offset is not None:
             with open(tag_fpath, "rb") as tag_file:
@@ -159,296 +231,126 @@ class TagDirectory(_VectorDataSource):
                     fields = line.split(b"\t")
                     # HOMER tag starts are 1-based; -1 gives the 0-based start.
                     read_start = int(fields[1]) - 1
-                    if read_start >= query_end:
+                    if read_start >= end:
                         break
-                    if self.read_handling == "starts":
-                        read_end = read_start + 1
-                    else:
-                        read_end = read_start + int(fields[4])
-                    coverage[
-                        max(read_start, query_start) - query_start : min(read_end, query_end)
-                        - query_start
-                    ] += float(fields[3])
+                    read_length = 1 if self.read_handling == "starts" else int(fields[4])
+                    covered = slice(
+                        max(read_start, start) - start, min(read_start + read_length, end) - start
+                    )
+                    coverage[covered] += float(fields[3])
 
-        return pandas.Series(
-            coverage * self.normalization_factor, index=numpy.arange(query_start, query_end)
-        )
+        return pandas.Series(coverage * self.normalization_factor, index=numpy.arange(start, end))
 
 
 class BigWigDataSource(_VectorDataSource):
-    """
-    Data source for reading signal data from BigWig files.
-
-    BigWig files are indexed binary files containing per-base signal values
-    commonly used for storing coverage, ChIP-seq signal, and other genomic
-    continuous data.
-
-    This class provides lazy loading of data - values are read from the BigWig
-    file only when queried, making it memory-efficient for large files.
-
-    Parameters
-    ----------
-    bigwig_path : str
-        Path to the BigWig file to read from.
-    chromosome_dialect : str, optional
-        The chromosome naming convention used in the BigWig file.
-        One of 'ucsc' (e.g., 'chr1'), 'ensembl' (e.g., '1'), or 'yeast' (Roman numerals).
-        Default is 'ucsc'.
-    fill_value : float, optional
-        Value to use for positions with no data in the BigWig file.
-        Default is 0.0 (not NaN, to ensure smooth plotting).
-    transform : callable, optional
-        A function to apply to query results. Default is None.
-    smoothing_bandwidth : int, optional
-        Standard deviation for Gaussian smoothing kernel. 0 means no smoothing.
-        Default is 0.
-
-    Examples
-    --------
-    >>> from pygbrowse import datasources
-    >>> bw = datasources.BigWigDataSource('/path/to/signal.bw')
-    >>> signal = bw['chr1'].loc[1000000:1001000]
-    >>>
-    >>> # With chromosome conversion for Ensembl-named BigWig
-    >>> bw_ensembl = datasources.BigWigDataSource(
-    ...     '/path/to/ensembl_signal.bw',
-    ...     chromosome_dialect='ensembl'
-    ... )
-    """
-
     def __init__(
         self,
-        bigwig_path: str,
+        bigwig_fpath: str | Path,
         chromosome_dialect: str = "ucsc",
         fill_value: float = 0.0,
-        transform=None,
-        smoothing_bandwidth: int = 0,
+        transform: VectorTransform | None = None,
+        smoothing_bandwidth: float = 0,
     ):
-        """
-        Initialize a BigWigDataSource.
+        """Read per-base signal from a BigWig file, lazily, one query at a time.
 
         Parameters
         ----------
-        bigwig_path : str
-            Path to the BigWig file. Must exist and be readable.
+        bigwig_fpath : str or Path
+            BigWig file.
         chromosome_dialect : str
-            Chromosome naming convention in the BigWig file.
-            Valid values: 'ucsc', 'ensembl', 'yeast'
+            Chromosome naming in the file: ``ucsc``, ``ensembl`` or ``yeast``. Queries
+            always use UCSC names and are converted.
         fill_value : float
-            Value to substitute for NaN positions.
-        transform : callable or None
-            Optional transformation function for query results.
-        smoothing_bandwidth : int
-            Gaussian smoothing standard deviation. 0 = no smoothing.
+            Value for positions without data and past the chromosome end.
+        transform : callable, optional
+            Applied to every query result.
+        smoothing_bandwidth : float
+            Gaussian smoothing standard deviation in bp; 0 disables smoothing.
 
         Raises
         ------
         FileNotFoundError
-            If bigwig_path does not exist.
+            If ``bigwig_fpath`` does not exist.
         ValueError
-            If bigwig_path exists but is not a valid BigWig file.
-            If chromosome_dialect is not one of the valid options.
+            If the file is not a BigWig or the dialect is unknown.
+
+        Examples
+        --------
+        >>> signal = BigWigDataSource("signal.bw").query("chr1", 1000000, 1001000)
         """
-        super(BigWigDataSource, self).__init__(
-            transform=transform, smoothing_bandwidth=smoothing_bandwidth
-        )
-
-        # Validate file exists before attempting to open
-        if not os.path.isfile(bigwig_path):
-            raise FileNotFoundError(f"BigWig file not found: {bigwig_path}")
-
-        # Validate chromosome dialect
-        valid_dialects = ("ucsc", "ensembl", "yeast")
-        if chromosome_dialect not in valid_dialects:
+        super().__init__(transform=transform, smoothing_bandwidth=smoothing_bandwidth)
+        if not os.path.isfile(bigwig_fpath):
+            raise FileNotFoundError(f"BigWig file not found: {bigwig_fpath}")
+        if chromosome_dialect not in CHROMOSOME_DIALECTS:
             raise ValueError(
-                f"chromosome_dialect must be one of {valid_dialects}, got '{chromosome_dialect}'"
+                f"chromosome_dialect must be one of {CHROMOSOME_DIALECTS}, "
+                f"got {chromosome_dialect!r}"
             )
-
-        self.bigwig_path = bigwig_path
+        self.bigwig_fpath = Path(bigwig_fpath)
         self.chromosome_dialect = chromosome_dialect
         self.fill_value = fill_value
-
-        # Validate file is actually a BigWig by attempting to open it
-        self._validate_and_cache_chroms()
-
-    def _validate_and_cache_chroms(self) -> None:
-        """
-        Validate the BigWig file and cache chromosome information.
-
-        Called during initialization to fail fast if the file is invalid.
-
-        Raises
-        ------
-        ValueError
-            If the file cannot be opened as a BigWig file.
-        """
-        import pyBigWig
-
-        handle = pyBigWig.open(str(self.bigwig_path))
-        if handle is None:
-            raise ValueError(f"Could not open as BigWig file: {self.bigwig_path}")
-
-        try:
-            self._chromosome_sizes = dict(handle.chroms())
-        finally:
-            handle.close()
-
-    @contextlib.contextmanager
-    def _get_bigwig_handle(self):
-        """
-        Context manager for safely accessing the BigWig file.
-
-        Opens a new handle for each query to ensure thread safety.
-        pyBigWig handles are lightweight so this is acceptable.
-
-        Yields
-        ------
-        pyBigWig.pyBigWig
-            Open BigWig file handle
-        """
-        import pyBigWig
-
-        handle = pyBigWig.open(str(self.bigwig_path))
-        if handle is None:
-            raise ValueError(f"Failed to open BigWig file: {self.bigwig_path}")
-        try:
-            yield handle
-        finally:
-            handle.close()
-
-    def _convert_query_chrom(self, query_chrom: str) -> str:
-        """
-        Convert a query chromosome name to the dialect used by the BigWig file.
-
-        The query chromosome name is assumed to be in UCSC format (consistent
-        with the rest of pygbrowse).
-
-        Parameters
-        ----------
-        query_chrom : str
-            Chromosome name from query (UCSC format, e.g., 'chr1')
-
-        Returns
-        -------
-        str
-            Chromosome name in the BigWig file's dialect
-
-        Raises
-        ------
-        KeyError
-            If the converted chromosome name is not present in the BigWig file.
-        """
-        # Convert from UCSC (query format) to the BigWig file's dialect
-        converted_chrom = utilities.convert_chromosome_name(
-            chrom_string=query_chrom, dialect=self.chromosome_dialect
+        with self._open() as bigwig_file:
+            self._chromosome_sizes = dict(bigwig_file.chroms())
+        logger.info(
+            "Opened BigWig %s with %d chromosomes", self.bigwig_fpath, len(self._chromosome_sizes)
         )
 
-        # Validate chromosome exists in the file
-        if converted_chrom not in self._chromosome_sizes:
-            # Try the original name as fallback
-            if query_chrom in self._chromosome_sizes:
-                return query_chrom
-            raise KeyError(
-                f"Chromosome '{query_chrom}' (converted to '{converted_chrom}') "
-                f"not found in BigWig file. Available chromosomes: "
-                f"{list(self._chromosome_sizes.keys())[:10]}..."
-            )
+    @contextlib.contextmanager
+    def _open(self) -> Iterator["pyBigWig.pyBigWig"]:
+        """Open the BigWig for one operation; a fresh handle per query is cheap and thread-safe."""
+        bigwig_file = pyBigWig.open(str(self.bigwig_fpath))
+        if bigwig_file is None:
+            raise ValueError(f"Could not open as BigWig file: {self.bigwig_fpath}")
+        try:
+            yield bigwig_file
+        finally:
+            bigwig_file.close()
 
-        return converted_chrom
-
-    def _query(self, query_chrom: str, query_start: int, query_end: int) -> pandas.Series:
-        """
-        Query the BigWig file for signal values in a genomic region.
-
-        Parameters
-        ----------
-        query_chrom : str
-            Chromosome name (UCSC format expected, e.g., 'chr1')
-        query_start : int
-            Start position (0-based, inclusive)
-        query_end : int
-            End position (0-based, exclusive)
-
-        Returns
-        -------
-        pandas.Series
-            Series with genomic positions as index and signal values as data.
-            Positions without data in the BigWig are filled with self.fill_value.
+    def _file_chrom(self, chrom: str) -> str:
+        """Convert a UCSC chromosome name to the file's name for it.
 
         Raises
         ------
         KeyError
-            If chromosome is not found in the BigWig file.
-        ValueError
-            If query coordinates are invalid (e.g., start >= end).
+            If neither the converted nor the original name is in the file.
         """
-        # Validate query coordinates
-        if query_start >= query_end:
-            raise ValueError(
-                f"query_start ({query_start}) must be less than query_end ({query_end})"
+        converted = utilities.convert_chromosome_name(chrom, dialect=self.chromosome_dialect)
+        for candidate in (converted, chrom):
+            if candidate in self._chromosome_sizes:
+                return candidate
+        raise KeyError(
+            f"Chromosome {chrom!r} (converted to {converted!r}) not found in "
+            f"{self.bigwig_fpath}. Available chromosomes: {list(self._chromosome_sizes)[:10]}..."
+        )
+
+    def _query(self, chrom, start, end):
+        if start >= end:
+            raise ValueError(f"start ({start}) must be less than end ({end})")
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+
+        file_chrom = self._file_chrom(chrom)
+        values = numpy.full(end - start, self.fill_value, dtype=numpy.float64)
+        data_end = min(end, self._chromosome_sizes[file_chrom])
+        if start < data_end:
+            with self._open() as bigwig_file:
+                file_values = numpy.array(
+                    bigwig_file.values(file_chrom, start, data_end), dtype=numpy.float64
+                )
+            values[: data_end - start] = numpy.where(
+                numpy.isnan(file_values), self.fill_value, file_values
             )
-
-        if query_start < 0:
-            raise ValueError(f"query_start must be non-negative, got {query_start}")
-
-        # Convert chromosome name to BigWig file's dialect
-        bigwig_chrom = self._convert_query_chrom(query_chrom)
-
-        # Clamp query_end to chromosome size to avoid pyBigWig errors
-        chrom_size = self._chromosome_sizes[bigwig_chrom]
-        effective_end = min(query_end, chrom_size)
-        effective_start = min(query_start, chrom_size)
-
-        # Handle case where query is entirely beyond chromosome end
-        if effective_start >= chrom_size:
-            return pandas.Series(
-                numpy.full(query_end - query_start, self.fill_value),
-                index=numpy.arange(query_start, query_end),
-            )
-
-        # Get values from BigWig file
-        with self._get_bigwig_handle() as bw:
-            values = bw.values(bigwig_chrom, effective_start, effective_end)
-
-        # Convert to numpy array and handle NaN values
-        values = numpy.array(values, dtype=numpy.float64)
-        nan_mask = numpy.isnan(values)
-        if nan_mask.any():
-            values[nan_mask] = self.fill_value
-
-        # Build the result series
-        result_index = numpy.arange(effective_start, effective_end)
-        result = pandas.Series(values, index=result_index)
-
-        # If query extended beyond chromosome, pad with fill_value
-        if effective_end < query_end:
-            padding_index = numpy.arange(effective_end, query_end)
-            padding = pandas.Series(
-                numpy.full(len(padding_index), self.fill_value), index=padding_index
-            )
-            result = pandas.concat([result, padding])
-
-        return result
+        return pandas.Series(values, index=numpy.arange(start, end))
 
     @property
-    def chromosomes(self) -> dict:
-        """
-        Return dictionary of chromosome names and sizes from the BigWig file.
-
-        Returns
-        -------
-        dict
-            Keys are chromosome names (in the BigWig file's dialect),
-            values are chromosome sizes in base pairs.
-        """
+    def chromosomes(self) -> dict[str, int]:
+        """Chromosome names (in the file's dialect) and sizes in bp."""
         return dict(self._chromosome_sizes)
 
     def __repr__(self) -> str:
-        """Return a string representation of this data source."""
+        """Return a short description of this data source."""
         return (
-            f"BigWigDataSource("
-            f"path='{self.bigwig_path}', "
-            f"dialect='{self.chromosome_dialect}', "
+            f"BigWigDataSource(path='{self.bigwig_fpath}', dialect='{self.chromosome_dialect}', "
             f"chromosomes={len(self._chromosome_sizes)})"
         )
 
@@ -465,23 +367,24 @@ class IntervalData:
     REQUIRED_COLUMNS = ["chrom", "chromStart", "chromEnd"]
     FILE_FORMATS = ("bed", "homer", "homer_annotated")
 
-    def __init__(self, interval_data, format="bed"):
-        """
-        Loads genomic interval information in various formats and stores them in a standardized form as a
-        pandas.DataFrame in self.data.
+    def __init__(self, interval_data: pandas.DataFrame | str | Path, format: str = "bed"):
+        """Genomic intervals, standardized to BED column names in ``self.data``.
 
-        :param:`interval_data` should be a pandas.DataFrame representing BED-formatted genomic data, or,
-        alternatively, a filename pointing to one of the following file formats:
+        Parameters
+        ----------
+        interval_data : pandas.DataFrame, str or Path
+            Either a DataFrame or a file. A DataFrame with ``chrom``, ``chromStart`` and
+            ``chromEnd`` columns is used as is; one without them is read as BED columns
+            in order (5 columns means ``name`` was moved to the index). A file is read
+            according to ``format``.
+        format : str
+            File format: ``bed``, ``homer`` (HOMER peak file) or ``homer_annotated``
+            (HOMER annotatePeaks.pl output). Ignored for DataFrames.
 
-        * A BED file
-        * A HOMER peak file
-        * A HOMER annotated peak file.
-
-        If a filename is passed instead of a DataFrame, :param:`format` should be specified. Allowed values are:
-            'bed', 'homer', 'homer_annotated'
-
-        :param interval_data:
-        :param format:
+        Raises
+        ------
+        ValueError
+            If ``format`` is unknown or an unnamed DataFrame has fewer than 3 columns.
         """
         if isinstance(interval_data, pandas.DataFrame):
             data = self._from_frame(interval_data)
@@ -489,15 +392,29 @@ class IntervalData:
             data = self._from_file(interval_data, format)
         self.data = data.sort_values(["chrom", "chromStart"])
 
-    def query(self, chrom, start, end):
-        """Return the intervals on ``chrom`` that overlap the 0-based half-open [start, end)."""
+    def query(self, chrom: str, start: int, end: int) -> pandas.DataFrame:
+        """Return the intervals on ``chrom`` that overlap the 0-based half-open [start, end).
+
+        Parameters
+        ----------
+        chrom : str
+            Chromosome, as named in the interval data.
+        start, end : int
+            Region, 0-based half-open.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Overlapping rows of ``self.data``.
+        """
         data = self.data
         return data.loc[
             (data["chrom"] == chrom) & (data["chromStart"] < end) & (data["chromEnd"] > start)
         ]
 
     @classmethod
-    def _from_frame(cls, frame):
+    def _from_frame(cls, frame: pandas.DataFrame) -> pandas.DataFrame:
+        """Standardize a DataFrame, naming BED columns by position if they are unnamed."""
         if set(cls.REQUIRED_COLUMNS).issubset(frame.columns):
             return frame
         logger.info("Treating the interval DataFrame as BED-style columns without names")
@@ -514,15 +431,19 @@ class IntervalData:
         return data
 
     @classmethod
-    def _bed_column_names(cls, num_columns):
+    def _bed_column_names(cls, num_columns: int) -> list[str]:
+        """Return BED column names for the first columns and ``column_<i>`` for the rest."""
         return list(cls.BED_COLUMNS[:num_columns]) + [
             f"column_{column_idx}" for column_idx in range(len(cls.BED_COLUMNS), num_columns)
         ]
 
     @classmethod
-    def _from_file(cls, interval_fpath, format):
+    def _from_file(cls, interval_fpath: str | Path, format: str) -> pandas.DataFrame:
+        """Read a BED, HOMER peak or HOMER annotated peak file."""
         if format not in cls.FILE_FORMATS:
-            raise ValueError(f"Unknown interval file format {format!r}; expected {cls.FILE_FORMATS}")
+            raise ValueError(
+                f"Unknown interval file format {format!r}; expected {cls.FILE_FORMATS}"
+            )
         logger.info("Reading %s intervals from %s", format, interval_fpath)
 
         if format == "bed":
@@ -533,8 +454,7 @@ class IntervalData:
         elif format == "homer":
             data = pandas.read_csv(interval_fpath, sep="\t", index_col=0, comment="#", header=None)
             data.columns = (
-                list(cls.HOMER_PEAKFILE_NAMES)
-                + list(data.columns)[len(cls.HOMER_PEAKFILE_NAMES) :]
+                list(cls.HOMER_PEAKFILE_NAMES) + list(data.columns)[len(cls.HOMER_PEAKFILE_NAMES) :]
             )
             data.index.name = "peak_id"
         else:
@@ -546,26 +466,50 @@ class IntervalData:
         return data
 
 
-class _GeneModels:
-    def __init__(self):
+GeneModelQueryResult = tuple[dict[str, dict], dict[str, dict], dict[str, dict], dict[str, list]]
+
+
+class _GeneModels(abc.ABC):
+    """Base class for sources of gene models (genes, transcripts, exons, UTRs)."""
+
+    @abc.abstractmethod
+    def _query(self, chrom: str, start: int, end: int) -> GeneModelQueryResult:
+        """Return gene models overlapping a 0-based half-open region."""
+
+    def query(self, chrom: str, start: int, end: int) -> GeneModelQueryResult:
+        """Return gene models overlapping a region.
+
+        Parameters
+        ----------
+        chrom : str
+            Chromosome, UCSC style.
+        start, end : int
+            Region, 0-based half-open.
+
+        Returns
+        -------
+        tuple of (dict, dict, dict, dict)
+            ``genes``, ``transcripts`` and ``components`` keyed by ID, each record holding
+            ``contig``, 0-based half-open ``start``/``end``, ``strand`` and the GFF3
+            attributes; genes list their ``transcripts`` and transcripts their
+            ``components``. The fourth dict maps gene ``Name`` to gene IDs.
         """
-        Superclass for data sources that describe gene models (gene boundaries, transcript
-        boundaries, exons, introns, UTRs, etc.).
-        """
-        pass
-
-    def _query(self, query_chromosome, query_start, query_end):
-        print("Must be overridden by inheritors!")
-
-    def query(self, chromosome, start, end):
-        return self._query(query_chromosome=chromosome, query_start=start, query_end=end)
+        return self._query(chrom, start, end)
 
 
-def _parse_gff3_attributes(attribute_column):
+def _parse_gff3_attributes(attribute_column: str) -> dict[str, str]:
     """Parse a GFF3 column-9 string into a dict of %-decoded values.
 
-    Empty fields (e.g. from a trailing ';') are skipped and only the first '=' splits a
-    key from its value.
+    Parameters
+    ----------
+    attribute_column : str
+        ``key=value`` pairs separated by ``;``.
+
+    Returns
+    -------
+    dict of str to str
+        Attributes. Empty fields (e.g. from a trailing ``;``) are skipped and only the
+        first ``=`` separates a key from its value.
     """
     pairs = (field.split("=", 1) for field in attribute_column.strip().split(";") if "=" in field)
     return {key.strip(): unquote(value) for key, value in pairs}
@@ -574,26 +518,43 @@ def _parse_gff3_attributes(attribute_column):
 class Gff3Annotations(_GeneModels):
     def __init__(
         self,
-        gff3_filename,
-        incoming_chromosome_name_converter=lambda x: utilities.convert_chromosome_name(
-            x, dialect="ensembl"
+        gff3_fpath: str | Path,
+        incoming_chromosome_name_converter: Callable[[str], str] = lambda chrom: (
+            utilities.convert_chromosome_name(chrom, dialect="ensembl")
         ),
-        feature_sources=DEFAULT_FEATURE_SOURCES,
-        gene_types=DEFAULT_GENE_TYPES,
-        transcript_types=DEFAULT_TRANSCRIPT_TYPES,
-        component_types=DEFAULT_COMPONENT_TYPES,
+        feature_sources: tuple[str, ...] = DEFAULT_FEATURE_SOURCES,
+        gene_types: tuple[str, ...] = DEFAULT_GENE_TYPES,
+        transcript_types: tuple[str, ...] = DEFAULT_TRANSCRIPT_TYPES,
+        component_types: tuple[str, ...] = DEFAULT_COMPONENT_TYPES,
     ):
-        super().__init__()
+        """Gene models from a bgzipped, tabix-indexed GFF3 file (Ensembl layout).
 
-        self.tabix_file = pysam.TabixFile(str(gff3_filename))
+        Prepare a plain GFF3 with ``utilities.bgzip_gff`` and
+        ``utilities.generate_tabix_index``.
+
+        Parameters
+        ----------
+        gff3_fpath : str or Path
+            Bgzipped GFF3 with a ``.tbi`` index next to it.
+        incoming_chromosome_name_converter : callable
+            Converts a UCSC query name to the file's contig name (default: Ensembl).
+        feature_sources : tuple of str
+            Column-2 sources to keep.
+        gene_types, transcript_types, component_types : tuple of str
+            Column-3 feature types treated as genes, transcripts and drawn components.
+        """
+        self.gff3_fpath = Path(gff3_fpath)
+        self.tabix_file = pysam.TabixFile(str(gff3_fpath))
         self.incoming_chromosome_name_converter = incoming_chromosome_name_converter
         self.feature_sources = feature_sources
         self.gene_types = gene_types
         self.transcript_types = transcript_types
         self.component_types = component_types
+        logger.info("Opened tabix-indexed GFF3 %s", self.gff3_fpath)
 
-    def _feature_record(self, split_line):
-        fields = _parse_gff3_attributes(split_line[8])
+    @staticmethod
+    def _feature_record(split_line: list[str]) -> dict:
+        """Build a feature record with 0-based half-open coordinates and its attributes."""
         record = {
             "contig": split_line[0],
             # GFF3 is 1-based closed; -1 on start gives 0-based half-open (end unchanged).
@@ -601,15 +562,16 @@ class Gff3Annotations(_GeneModels):
             "end": int(split_line[4]),
             "strand": split_line[6],
         }
-        record.update(fields)
+        record.update(_parse_gff3_attributes(split_line[8]))
         return record
 
-    def _query(self, query_chromosome, query_start, query_end):
+    def _query(self, chrom, start, end):
         genes, transcripts, components = {}, {}, {}
-        gene_names_to_ensembl_ids = {}
+        gene_names_to_ids = {}
 
+        # pysam fetch takes 0-based half-open coordinates, the same as the query.
         query_rows = self.tabix_file.fetch(
-            self.incoming_chromosome_name_converter(query_chromosome), query_start, query_end
+            self.incoming_chromosome_name_converter(chrom), start, end
         )
         for line in query_rows:
             split_line = line.strip("\n").split("\t")
@@ -622,7 +584,7 @@ class Gff3Annotations(_GeneModels):
                 record["Name"] = record.get("Name", record["ID"])
                 record["transcripts"] = []
                 genes[record["ID"]] = record
-                gene_names_to_ensembl_ids.setdefault(record["Name"], []).append(record["ID"])
+                gene_names_to_ids.setdefault(record["Name"], []).append(record["ID"])
             elif feature_type in self.transcript_types:
                 record["components"] = []
                 transcripts[record["ID"]] = record
@@ -632,10 +594,22 @@ class Gff3Annotations(_GeneModels):
 
         self._link_children(genes, transcripts, "transcripts", "transcript")
         self._link_children(transcripts, components, "components", "component")
-        return genes, transcripts, components, gene_names_to_ensembl_ids
+        logger.info(
+            "Found %d genes, %d transcripts, %d components in %s:%d-%d",
+            len(genes),
+            len(transcripts),
+            len(components),
+            chrom,
+            start,
+            end,
+        )
+        return genes, transcripts, components, gene_names_to_ids
 
     @staticmethod
-    def _link_children(parents, children, child_list_key, child_kind):
+    def _link_children(
+        parents: dict[str, dict], children: dict[str, dict], child_list_key: str, child_kind: str
+    ) -> None:
+        """Append each child's ID to the ``child_list_key`` list of every parent it names."""
         # ponytail: Parent is split on ',' after %-decoding, so an ID with an encoded %2C
         # mis-splits; split before decoding if such IDs turn up.
         for child_id, child_data in children.items():
@@ -643,50 +617,97 @@ class Gff3Annotations(_GeneModels):
                 if parent_id in parents:
                     parents[parent_id][child_list_key].append(child_id)
                 else:
-                    logger.warning("Orphan %s %s with missing parent %s", child_kind, child_id, parent_id)
+                    logger.warning(
+                        "Orphan %s %s with missing parent %s", child_kind, child_id, parent_id
+                    )
 
 
-class _MatrixData:
-    def __init__(self):
-        pass
+class _MatrixData(abc.ABC):
+    """Base class for binned contact matrices. Subclasses set ``bin_size``."""
 
-    def _query(self):
-        print("Must be overridden by inheritors")
+    bin_size: int
 
-    def query(self, chrom, start, end):
-        return self._query(query_chrom=chrom, query_start=start, query_end=end)
+    @abc.abstractmethod
+    def _query(self, chrom: str, start: int, end: int) -> pandas.DataFrame:
+        """Return the matrix block for a region."""
+
+    def query(self, chrom: str, start: int, end: int) -> pandas.DataFrame:
+        """Return the square block of bins from ``start`` to ``end``, rounded to bins.
+
+        Parameters
+        ----------
+        chrom : str
+            Chromosome, as named in the matrix source.
+        start, end : int
+            Region in bp; both ends are rounded to the nearest bin and included.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Matrix block indexed and labeled by bin start.
+        """
+        return self._query(chrom, start, end)
 
 
 class HicDataDir(_MatrixData):
-    def __init__(self, fname_template, bin_size=10000):
-        self.fname_template = fname_template
+    def __init__(self, fpath_template: str, bin_size: int = 10000):
+        """Hi-C matrices stored as one TSV file per chromosome.
+
+        Parameters
+        ----------
+        fpath_template : str
+            Path with one ``{}`` placeholder for the chromosome name. Each file is a
+            square matrix with bin starts as row and column labels.
+        bin_size : int
+            Bin size in bp.
+        """
+        self.fpath_template = fpath_template
         self.bin_size = bin_size
 
-    def _query(self, query_chrom, query_start, query_end):
-        this_chrom_fname = self.fname_template.format(query_chrom)
-        this_chrom_data = pandas.read_csv(this_chrom_fname, sep="\t", index_col=0)
-        this_chrom_data.columns = this_chrom_data.columns.astype(int)
+    def _query(self, chrom, start, end):
+        chrom_fpath = self.fpath_template.format(chrom)
+        chrom_data = pandas.read_csv(chrom_fpath, sep="\t", index_col=0)
+        chrom_data.columns = chrom_data.columns.astype(int)
+        logger.info("Read a %d x %d matrix from %s", *chrom_data.shape, chrom_fpath)
 
-        rounded_start = utilities.roundto(query_start, self.bin_size)
-        rounded_end = utilities.roundto(query_end, self.bin_size)
-
-        return this_chrom_data.loc[rounded_start:rounded_end, rounded_start:rounded_end]
+        rounded_start = utilities.roundto(start, self.bin_size)
+        rounded_end = utilities.roundto(end, self.bin_size)
+        return chrom_data.loc[rounded_start:rounded_end, rounded_start:rounded_end]
 
 
 class HicDataDict(_MatrixData):
-    def __init__(self, data_dict, bin_size):
-        # self.data_dict = {chrom:self.rename_hic_df(data_dict[chrom]) for chrom in data_dict}
+    def __init__(self, data_dict: dict[str, pandas.DataFrame], bin_size: int):
+        """Hi-C matrices held in memory, one DataFrame per chromosome.
+
+        Parameters
+        ----------
+        data_dict : dict of str to pandas.DataFrame
+            Square matrices with bin starts as row and column labels.
+        bin_size : int
+            Bin size in bp.
+        """
         self.data_dict = data_dict
         self.bin_size = bin_size
 
-    def _query(self, query_chrom, query_start, query_end):
-        rounded_start = utilities.roundto(query_start, self.bin_size)
-        rounded_end = utilities.roundto(query_end, self.bin_size)
-
-        return self.data_dict[query_chrom].loc[rounded_start:rounded_end, rounded_start:rounded_end]
+    def _query(self, chrom, start, end):
+        rounded_start = utilities.roundto(start, self.bin_size)
+        rounded_end = utilities.roundto(end, self.bin_size)
+        return self.data_dict[chrom].loc[rounded_start:rounded_end, rounded_start:rounded_end]
 
     @staticmethod
-    def rename_hic_df(hic_df):
+    def rename_hic_df(hic_df: pandas.DataFrame) -> pandas.DataFrame:
+        """Relabel ``<chrom>-<bin start>`` row and column labels as integer bin starts.
+
+        Parameters
+        ----------
+        hic_df : pandas.DataFrame
+            Matrix with string labels like ``chr1-10000``. Modified in place.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The same DataFrame.
+        """
         hic_df.index = [int(name.split("-")[1]) for name in hic_df.index]
         hic_df.columns = [int(name.split("-")[1]) for name in hic_df.columns]
         return hic_df

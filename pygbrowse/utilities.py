@@ -1,10 +1,12 @@
-import datetime
+"""Helpers: chromosome-name conversion, HOMER tag-file search, GFF3 bgzip/tabix, axes tweaks."""
+
 import gzip
 import logging
 import os
 import tempfile
 from pathlib import Path
 
+import matplotlib.axes
 import numpy
 import pysam
 from scipy.stats import norm
@@ -12,13 +14,20 @@ from scipy.stats import norm
 logger = logging.getLogger(__name__)
 
 
-# ToDo: Bring back scale bar
-# ToDo: Add option for solid fill of vectors
+def roundto(num: float, nearest: float) -> int:
+    """Round ``num`` to the nearest multiple of ``nearest`` (halves round up).
 
+    Parameters
+    ----------
+    num : float
+        Value to round.
+    nearest : float
+        Increment to round to.
 
-def roundto(num, nearest):
-    """
-    Rounds :param:`num` to the nearest increment of :param:`nearest`
+    Returns
+    -------
+    int
+        The rounded value.
     """
     return int((num + (nearest / 2)) // nearest * nearest)
 
@@ -26,8 +35,24 @@ def roundto(num, nearest):
 YEAST_ROMAN_NUMERALS = {
     str(number): numeral
     for number, numeral in enumerate(
-        ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV",
-         "XV", "XVI"],
+        [
+            "I",
+            "II",
+            "III",
+            "IV",
+            "V",
+            "VI",
+            "VII",
+            "VIII",
+            "IX",
+            "X",
+            "XI",
+            "XII",
+            "XIII",
+            "XIV",
+            "XV",
+            "XVI",
+        ],
         start=1,
     )
 }
@@ -173,53 +198,41 @@ def generate_tabix_index(target_fpath: str | Path) -> Path:
     return indexed_fpath
 
 
-def pretty_now():
+def gaussian_kernel(sd: float, sd_cutoff: float = 3, normalize: bool = False) -> numpy.ndarray:
+    """Return a Gaussian kernel for smoothing per-base signal.
+
+    Parameters
+    ----------
+    sd : float
+        Standard deviation in bp.
+    sd_cutoff : float
+        Half-width of the kernel in standard deviations.
+    normalize : bool
+        Scale so the peak is 1; otherwise the values are the normal PDF.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``2 * int(sd_cutoff * sd) + 1`` kernel weights, centered on the middle element.
     """
-    Returns the current date/time in a nicely formatted string (without decimal seconds)
-    """
-    return datetime.datetime.strftime(datetime.datetime.now(), "%Y-%b-%d %H:%M:%S")
+    half_width = int(sd_cutoff * sd)
+    kernel = norm(scale=sd).pdf(numpy.arange(-half_width, half_width + 1))
+    return kernel / kernel.max() if normalize else kernel
 
 
-def log_print(message, tabs=1):
-    """
-    Print a chunk of text preceded by a timestamp and an optional number of tabs (default 1).
+def add_label(ax: matplotlib.axes.Axes, tick: float, tick_label: str, axis: str = "x") -> None:
+    """Add a labeled tick to an axis, or relabel the tick if it exists.
 
-    :param message:
-    :param tabs:
-    :return:
-    """
-    print("{}{}{}".format(pretty_now(), "\t" * tabs, message))
-
-
-def gaussian_kernel(sd, sd_cutoff=3, normalize=False):
-    """
-    Generate and return a numpy.Array whose elements are proportional to the PDF of a normal distribution
-    having standard deviation :param:`sd`.
-
-    :param sd:
-    :param sd_cutoff:
-    :param normalize:
-    :return:
-    """
-    bw = sd_cutoff * sd * 2 + 1
-    midpoint = sd_cutoff * sd
-    kern = numpy.zeros(bw)
-    frozen_rv = norm(scale=sd)
-    for i in range(bw):
-        kern[i] = frozen_rv.pdf(i - midpoint)
-    if normalize:
-        kern = kern / kern.max()
-    return kern
-
-
-def add_label(ax, tick, tick_label, axis="x"):
-    """
-    Updates the set of ticks and tick labels for the specified matplotlib.Axes object
-    and axis.
-
-    If the tick already exists, it's label will be updated. If not, it will be created and labeled
-    appropriately.
-
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to change.
+    tick : float
+        Tick position in data units.
+    tick_label : str
+        Label for the tick.
+    axis : str
+        ``x`` or ``y``.
     """
     if axis == "y":
         tick_getter, label_getter = ax.get_yticks, ax.get_yticklabels
@@ -235,74 +248,49 @@ def add_label(ax, tick, tick_label, axis="x"):
     label_setter(new_labels)
 
 
-def adjust_limits(ax, new_position, axis="y", padding_fraction=0.1):
-    """
-    If necessary adjusts the limits for the specified :param axis: on
-    :param ax: to accomodate :param new_position: according to the
-    following scheme:
+def adjust_limits(
+    ax: matplotlib.axes.Axes,
+    new_position: float,
+    axis: str = "y",
+    padding_fraction: float = 0.1,
+) -> None:
+    """Widen an axis' limits, if needed, so that ``new_position`` is inside the content range.
 
-    1. Assumes that the current limits are the
-        smallest and largest content item minus / plus a padding equal to
-        :param padding_fraction: * the span between the smallest
-        and largest content item.
-    2. If :param new_position: is beyond the inferred content limits,
-        adjust the padding to :param padding_fraction: * the new content
-        span, then adjust the plot limits to the new content limits
-        minus / plus the new padding.
-    """
-    assert padding_fraction < 0.5, "padding_fraction must be below 0.5!"
+    The current limits are assumed to be the content range padded on each side by
+    ``padding_fraction`` of its span. If ``new_position`` lies outside that content range,
+    the range is extended to it and padded again by the same fraction.
 
-    if axis == "y":
-        limit_getter = ax.get_ylim
-        limit_setter = ax.set_ylim
-    else:
-        limit_getter = ax.get_xlim
-        limit_setter = ax.set_xlim
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to change.
+    new_position : float
+        Position, in data units, that must fit.
+    axis : str
+        ``x`` or ``y``.
+    padding_fraction : float
+        Padding on each side as a fraction of the content span; must be below 0.5.
+
+    Raises
+    ------
+    ValueError
+        If ``padding_fraction`` is 0.5 or more.
+    """
+    if padding_fraction >= 0.5:
+        raise ValueError(f"padding_fraction must be below 0.5, got {padding_fraction}")
+    limit_getter, limit_setter = (
+        (ax.get_ylim, ax.set_ylim) if axis == "y" else (ax.get_xlim, ax.set_xlim)
+    )
 
     current_plot_min, current_plot_max = limit_getter()
-    current_plot_span = current_plot_max - current_plot_min
-    current_data_span = current_plot_span / (1 + 2 * padding_fraction)
+    current_data_span = (current_plot_max - current_plot_min) / (1 + 2 * padding_fraction)
     current_pad = current_data_span * padding_fraction
     current_data_min = current_plot_min + current_pad
     current_data_max = current_plot_max - current_pad
 
-    #     print(current_plot_min, current_plot_max, current_plot_span)
-    #     print(current_data_min, current_data_max, current_data_span, current_pad)
-
-    if new_position > current_data_max:
-        new_data_min = current_data_min
-        new_data_max = new_position
-
-    elif new_position < current_data_min:
-        new_data_min = new_position
-        new_data_max = current_data_max
-    else:
-        # no changes needed
+    if current_data_min <= new_position <= current_data_max:
         return
-
-    new_data_span = new_data_max - new_data_min
-    new_pad = new_data_span * padding_fraction
-    new_plot_min = new_data_min - new_pad
-    new_plot_max = new_data_max + new_pad
-
-    #     print(new_data_min, new_data_max, new_data_span, new_pad)
-    #     print(new_plot_min, new_plot_max)
-
-    limit_setter((new_plot_min, new_plot_max))
-
-
-def diag_indices(n, k=0):
-    """
-    Return the indices corresponding to the kth diagonal of an n X n array
-    in the form of a tuple of (x coords, y coords).
-
-    Created since numpy does not provide this functionality.
-    """
-    if k <= 0:
-        x_coords = numpy.arange(-k, n)
-        y_coords = numpy.arange(0, n + k)
-    else:
-        x_coords = numpy.arange(0, n - k)
-        y_coords = numpy.arange(k, n)
-
-    return (x_coords, y_coords)
+    new_data_min = min(current_data_min, new_position)
+    new_data_max = max(current_data_max, new_position)
+    new_pad = (new_data_max - new_data_min) * padding_fraction
+    limit_setter((new_data_min - new_pad, new_data_max + new_pad))

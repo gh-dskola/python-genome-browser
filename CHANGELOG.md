@@ -38,6 +38,43 @@ listed under a `### Breaking changes` heading with a *Migration:* note.
   *Migration:* pass the template explicitly; rename the keyword.
 - **`GeneModelPlot(genes_include=...)` matches whole gene names**, not substrings.
   *Migration:* list every gene name to show.
+- **One query signature, one data-parameter name, `_fpath` path names.** Every data source
+  has `query(chrom, start, end)` (0-based half-open), every plot takes its data source as
+  `data`, and path parameters end in `_fpath`. Positional calls are unaffected.
+  *Migration:* rename keyword arguments and attributes:
+
+  | Old | New |
+  |---|---|
+  | `<vector source>.query(query_chrom=, query_start=, query_end=)` | `.query(chrom=, start=, end=)` |
+  | `Gff3Annotations.query(chromosome=, ...)` | `.query(chrom=, ...)` |
+  | `Gff3Annotations(gff3_filename=)` | `Gff3Annotations(gff3_fpath=)` |
+  | `BigWigDataSource(bigwig_path=)`, `.bigwig_path` | `BigWigDataSource(bigwig_fpath=)`, `.bigwig_fpath` |
+  | `HicDataDir(fname_template=)` | `HicDataDir(fpath_template=)` |
+  | `SparseVectors(convolution_kernel=)` | `SparseVectors(smoothing_bandwidth=)` |
+  | `BedPlot(interval_data=)`, `.interval_data` | `BedPlot(data=)`, `.data` (the `IntervalData`, not its DataFrame) |
+  | `WigPlot(genomic_vector_data=)` | `WigPlot(data=)` |
+  | `GeneModelPlot(gene_annotation_data=)`, `.gene_annotation_data` | `GeneModelPlot(data=)`, `.data` |
+  | `InteractionPlot(interaction_df=)`, `.interaction_df` | `InteractionPlot(data=)`, `.data` |
+  | `utilities.binary_search_tag_file(tag_filename=)` | `binary_search_tag_file(tag_fpath=)` |
+  | `utilities.bgzip_gff(gff3_fname=, bgzipped_fname=)` | `bgzip_gff(gff3_fpath=, bgzipped_fpath=)` |
+  | `utilities.generate_tabix_index(target_fname=)` | `generate_tabix_index(target_fpath=)` |
+- **Arc helpers moved** from `plots` to the private `pygbrowse._arcs`.
+  *Migration:* import `draw_arc`, `draw_visible_arc`, `draw_arc_interaction` from `pygbrowse._arcs`.
+- **`utilities.log_print`, `utilities.pretty_now`, `utilities.diag_indices` and the
+  `intervaloverlaps` module removed.** The package logs through `logging`.
+  *Migration:* configure `logging` (e.g. `logging.basicConfig(level=logging.INFO)`) to see
+  messages; use `numpy.diag_indices`/`numpy.indices` for diagonals.
+
+These breaking changes ship as 0.4.0.
+
+### Changed
+
+- Base classes use `abc.ABC`; `HicPlot` is a `_BrowserSubPlot`.
+- Messages go through `logging.getLogger(__name__)` instead of `print`.
+- Type hints and numpy-style docstrings on the public API; the coordinate convention is
+  stated in the `datasources` module docstring.
+- Demo notebook: `from imp import reload` → `from importlib import reload` (`imp` is gone
+  in Python 3.12).
 
 ### Fixed
 
