@@ -165,3 +165,38 @@ def test_visualize_leaves_global_rcparams_unchanged() -> None:
     browser = plots.GenomeBrowser([[plots.BedPlot(datasources.IntervalData(interval_frame()))]])
     browser.visualize("chr1", 0, 1000)
     assert dict(matplotlib.rcParams) == before
+
+
+# --- Smoke render of every track type ---------------------------------------------------
+
+
+def test_every_track_type_renders(
+    gff3_fpath: Path,
+    bigwig_fpath: Path,
+    tag_directory_path: Path,
+    bed_fpath: Path,
+    tmp_path: Path,
+) -> None:
+    """A browser with one row per track type renders and saves to PNG."""
+    interactions = pandas.DataFrame(
+        {"chr1": ["chr1"], "start1": [100], "end1": [200], "start2": [700], "end2": [800]}
+    )
+    browser = plots.GenomeBrowser(
+        [
+            [plots.GeneModelPlot(data=datasources.Gff3Annotations(gff3_fpath))],
+            [plots.WigPlot(data=datasources.BigWigDataSource(bigwig_fpath), label="BigWig")],
+            [plots.WigPlot(data=datasources.TagDirectory(tag_directory_path), solid=False)],
+            [
+                plots.BedPlot(
+                    data=datasources.IntervalData(bed_fpath), label="peaks", color_by="score"
+                )
+            ],
+            [plots.InteractionPlot(data=interactions, bin_size=100)],
+            [plots.HicPlot(data=datasources.HicDataDict({"chr1": hic_matrix()}, 10))],
+        ]
+    )
+    figure = browser.visualize("chr1", 0, 1000, row_heights=[1, 1, 1, 0.5, 1, 1])
+    assert len(figure.axes) == 6
+    png_fpath = tmp_path / "browser.png"
+    figure.savefig(png_fpath)
+    assert png_fpath.stat().st_size > 0

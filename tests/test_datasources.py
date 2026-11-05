@@ -227,3 +227,81 @@ def test_bigwig_query_values_and_padding(bigwig_fpath: Path) -> None:
     padded = bigwig.query("chr2", 4990, 5010)
     assert len(padded) == 20
     assert padded.sum() == 0.0
+
+
+# --- Keyword API, input variants and options --------------------------------------------
+
+
+def test_every_source_takes_chrom_start_end_keywords(
+    bigwig_fpath: Path, tag_directory_path: Path, gff3_fpath: Path, bed_fpath: Path
+) -> None:
+    """query(chrom=, start=, end=) works on every data source."""
+    region = {"chrom": "chr1", "start": 100, "end": 200}
+    assert len(datasources.BigWigDataSource(bigwig_fpath=bigwig_fpath).query(**region)) == 100
+    assert (
+        len(datasources.TagDirectory(tag_directory_path=tag_directory_path).query(**region)) == 100
+    )
+    assert "gene:GA" in datasources.Gff3Annotations(gff3_fpath=gff3_fpath).query(**region)[0]
+    assert list(datasources.IntervalData(bed_fpath).query(**region).index) == ["wide", "peak1"]
+    sparse = datasources.SparseVectors({"chr1": pandas.Series([1.0], index=[150])})
+    assert sparse.query(**region).tolist() == [1.0]
+
+
+def test_interval_query_is_half_open(bed_fpath: Path) -> None:
+    """An interval ending exactly at the window start does not overlap it."""
+    intervals = datasources.IntervalData(bed_fpath)
+    assert "peak1" not in intervals.query("chr1", 200, 300).index
+    assert "peak1" in intervals.query("chr1", 199, 300).index
+
+
+@pytest.mark.parametrize("num_columns", [3, 4, 6, 7])
+def test_interval_data_unnamed_frames(num_columns: int) -> None:
+    """Unnamed DataFrames are read as BED columns in order."""
+    row = ["chr1", 10, 20, "a", 1.0, "+", "extra"][:num_columns]
+    intervals = datasources.IntervalData(pandas.DataFrame([row]))
+    assert intervals.data["chromStart"].tolist() == [10]
+    assert intervals.data["chromEnd"].tolist() == [20]
+
+
+def test_interval_data_five_column_frame_has_name_in_index() -> None:
+    """A five-column unnamed DataFrame is read as BED with the name moved to the index."""
+    frame = pandas.DataFrame([["chr1", 10, 20, 1.0, "+"]], index=["a"])
+    intervals = datasources.IntervalData(frame)
+    assert intervals.data.loc["a", "strand"] == "+"
+
+
+def test_interval_data_three_column_bed_file(tmp_path: Path) -> None:
+    """A BED3 file loads."""
+    bed_fpath = tmp_path / "bed3.bed"
+    bed_fpath.write_text("chr1\t10\t20\nchr1\t30\t40\n")
+    assert len(datasources.IntervalData(bed_fpath).query("chr1", 0, 100)) == 2
+
+
+def test_bigwig_ensembl_dialect(tmp_path: Path) -> None:
+    """A BigWig with Ensembl contig names answers UCSC-named queries."""
+    import pyBigWig
+
+    bigwig_fpath = tmp_path / "ensembl.bw"
+    bigwig_file = pyBigWig.open(str(bigwig_fpath), "w")
+    bigwig_file.addHeader([("1", 100)])
+    bigwig_file.addEntries("1", 0, values=[5.0] * 10, span=1, step=1)
+    bigwig_file.close()
+    bigwig = datasources.BigWigDataSource(bigwig_fpath, chromosome_dialect="ensembl")
+    assert bigwig.query("chr1", 0, 10).tolist() == [5.0] * 10
+
+
+def test_bigwig_unknown_chromosome_raises(bigwig_fpath: Path) -> None:
+    """A chromosome missing from the BigWig raises KeyError."""
+    with pytest.raises(KeyError, match="chr9"):
+        datasources.BigWigDataSource(bigwig_fpath).query("chr9", 0, 10)
+
+
+def test_smoothing_preserves_total_signal() -> None:
+    """Gaussian smoothing spreads a spike; its total becomes the kernel's weight sum."""
+    series = pandas.Series(numpy.zeros(101), index=numpy.arange(101))
+    series.loc[50] = 1.0
+    smoothed = datasources.SparseVectors({"chr1": series}, smoothing_bandwidth=2).query(
+        "chr1", 0, 101
+    )
+    assert smoothed.loc[50] < 1.0
+    assert smoothed.sum() == pytest.approx(utilities.gaussian_kernel(2).sum())
