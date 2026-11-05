@@ -1,0 +1,8 @@
+# Revisions skipped by `git blame` when blame.ignoreRevsFile is configured:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only purely mechanical commits (formatting, import order) belong here.
+
+# Apply ruff format and import sorting to pygbrowse/
+d9c42f943aca0b4aa6369a24d7d460f0aa49c78e
