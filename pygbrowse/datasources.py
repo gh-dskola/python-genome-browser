@@ -1,3 +1,4 @@
+import contextlib
 import os
 
 import numpy
@@ -146,6 +147,294 @@ class TagDirectory(_VectorDataSource):
         query_result *= self.normalization_factor
 
         return query_result
+
+
+class BigWigDataSource(_VectorDataSource):
+    """
+    Data source for reading signal data from BigWig files.
+
+    BigWig files are indexed binary files containing per-base signal values
+    commonly used for storing coverage, ChIP-seq signal, and other genomic
+    continuous data.
+
+    This class provides lazy loading of data - values are read from the BigWig
+    file only when queried, making it memory-efficient for large files.
+
+    Parameters
+    ----------
+    bigwig_path : str
+        Path to the BigWig file to read from.
+    chromosome_dialect : str, optional
+        The chromosome naming convention used in the BigWig file.
+        One of 'ucsc' (e.g., 'chr1'), 'ensembl' (e.g., '1'), or 'yeast' (Roman numerals).
+        Default is 'ucsc'.
+    fill_value : float, optional
+        Value to use for positions with no data in the BigWig file.
+        Default is 0.0 (not NaN, to ensure smooth plotting).
+    transform : callable, optional
+        A function to apply to query results. Default is None.
+    smoothing_bandwidth : int, optional
+        Standard deviation for Gaussian smoothing kernel. 0 means no smoothing.
+        Default is 0.
+
+    Examples
+    --------
+    >>> from pygbrowse import datasources
+    >>> bw = datasources.BigWigDataSource('/path/to/signal.bw')
+    >>> signal = bw['chr1'].loc[1000000:1001000]
+    >>>
+    >>> # With chromosome conversion for Ensembl-named BigWig
+    >>> bw_ensembl = datasources.BigWigDataSource(
+    ...     '/path/to/ensembl_signal.bw',
+    ...     chromosome_dialect='ensembl'
+    ... )
+    """
+
+    def __init__(
+        self,
+        bigwig_path: str,
+        chromosome_dialect: str = 'ucsc',
+        fill_value: float = 0.0,
+        transform=None,
+        smoothing_bandwidth: int = 0
+    ):
+        """
+        Initialize a BigWigDataSource.
+
+        Parameters
+        ----------
+        bigwig_path : str
+            Path to the BigWig file. Must exist and be readable.
+        chromosome_dialect : str
+            Chromosome naming convention in the BigWig file.
+            Valid values: 'ucsc', 'ensembl', 'yeast'
+        fill_value : float
+            Value to substitute for NaN positions.
+        transform : callable or None
+            Optional transformation function for query results.
+        smoothing_bandwidth : int
+            Gaussian smoothing standard deviation. 0 = no smoothing.
+
+        Raises
+        ------
+        FileNotFoundError
+            If bigwig_path does not exist.
+        ValueError
+            If bigwig_path exists but is not a valid BigWig file.
+            If chromosome_dialect is not one of the valid options.
+        """
+        super(BigWigDataSource, self).__init__(
+            transform=transform,
+            smoothing_bandwidth=smoothing_bandwidth
+        )
+
+        # Validate file exists before attempting to open
+        if not os.path.isfile(bigwig_path):
+            raise FileNotFoundError(f"BigWig file not found: {bigwig_path}")
+
+        # Validate chromosome dialect
+        valid_dialects = ('ucsc', 'ensembl', 'yeast')
+        if chromosome_dialect not in valid_dialects:
+            raise ValueError(
+                f"chromosome_dialect must be one of {valid_dialects}, "
+                f"got '{chromosome_dialect}'"
+            )
+
+        self.bigwig_path = bigwig_path
+        self.chromosome_dialect = chromosome_dialect
+        self.fill_value = fill_value
+
+        # Validate file is actually a BigWig by attempting to open it
+        self._validate_and_cache_chroms()
+
+    def _validate_and_cache_chroms(self) -> None:
+        """
+        Validate the BigWig file and cache chromosome information.
+
+        Called during initialization to fail fast if the file is invalid.
+
+        Raises
+        ------
+        ValueError
+            If the file cannot be opened as a BigWig file.
+        """
+        import pyBigWig
+
+        handle = pyBigWig.open(self.bigwig_path)
+        if handle is None:
+            raise ValueError(f"Could not open as BigWig file: {self.bigwig_path}")
+
+        try:
+            self._chromosome_sizes = dict(handle.chroms())
+        finally:
+            handle.close()
+
+    @contextlib.contextmanager
+    def _get_bigwig_handle(self):
+        """
+        Context manager for safely accessing the BigWig file.
+
+        Opens a new handle for each query to ensure thread safety.
+        pyBigWig handles are lightweight so this is acceptable.
+
+        Yields
+        ------
+        pyBigWig.pyBigWig
+            Open BigWig file handle
+        """
+        import pyBigWig
+
+        handle = pyBigWig.open(self.bigwig_path)
+        if handle is None:
+            raise ValueError(f"Failed to open BigWig file: {self.bigwig_path}")
+        try:
+            yield handle
+        finally:
+            handle.close()
+
+    def _convert_query_chrom(self, query_chrom: str) -> str:
+        """
+        Convert a query chromosome name to the dialect used by the BigWig file.
+
+        The query chromosome name is assumed to be in UCSC format (consistent
+        with the rest of pygbrowse).
+
+        Parameters
+        ----------
+        query_chrom : str
+            Chromosome name from query (UCSC format, e.g., 'chr1')
+
+        Returns
+        -------
+        str
+            Chromosome name in the BigWig file's dialect
+
+        Raises
+        ------
+        KeyError
+            If the converted chromosome name is not present in the BigWig file.
+        """
+        # Convert from UCSC (query format) to the BigWig file's dialect
+        converted_chrom = utilities.convert_chromosome_name(
+            chrom_string=query_chrom,
+            dialect=self.chromosome_dialect
+        )
+
+        # Validate chromosome exists in the file
+        if converted_chrom not in self._chromosome_sizes:
+            # Try the original name as fallback
+            if query_chrom in self._chromosome_sizes:
+                return query_chrom
+            raise KeyError(
+                f"Chromosome '{query_chrom}' (converted to '{converted_chrom}') "
+                f"not found in BigWig file. Available chromosomes: "
+                f"{list(self._chromosome_sizes.keys())[:10]}..."
+            )
+
+        return converted_chrom
+
+    def _query(
+        self,
+        query_chrom: str,
+        query_start: int,
+        query_end: int
+    ) -> pandas.Series:
+        """
+        Query the BigWig file for signal values in a genomic region.
+
+        Parameters
+        ----------
+        query_chrom : str
+            Chromosome name (UCSC format expected, e.g., 'chr1')
+        query_start : int
+            Start position (0-based, inclusive)
+        query_end : int
+            End position (0-based, exclusive)
+
+        Returns
+        -------
+        pandas.Series
+            Series with genomic positions as index and signal values as data.
+            Positions without data in the BigWig are filled with self.fill_value.
+
+        Raises
+        ------
+        KeyError
+            If chromosome is not found in the BigWig file.
+        ValueError
+            If query coordinates are invalid (e.g., start >= end).
+        """
+        # Validate query coordinates
+        if query_start >= query_end:
+            raise ValueError(
+                f"query_start ({query_start}) must be less than "
+                f"query_end ({query_end})"
+            )
+
+        if query_start < 0:
+            raise ValueError(f"query_start must be non-negative, got {query_start}")
+
+        # Convert chromosome name to BigWig file's dialect
+        bigwig_chrom = self._convert_query_chrom(query_chrom)
+
+        # Clamp query_end to chromosome size to avoid pyBigWig errors
+        chrom_size = self._chromosome_sizes[bigwig_chrom]
+        effective_end = min(query_end, chrom_size)
+        effective_start = min(query_start, chrom_size)
+
+        # Handle case where query is entirely beyond chromosome end
+        if effective_start >= chrom_size:
+            return pandas.Series(
+                numpy.full(query_end - query_start, self.fill_value),
+                index=numpy.arange(query_start, query_end)
+            )
+
+        # Get values from BigWig file
+        with self._get_bigwig_handle() as bw:
+            values = bw.values(bigwig_chrom, effective_start, effective_end)
+
+        # Convert to numpy array and handle NaN values
+        values = numpy.array(values, dtype=numpy.float64)
+        nan_mask = numpy.isnan(values)
+        if nan_mask.any():
+            values[nan_mask] = self.fill_value
+
+        # Build the result series
+        result_index = numpy.arange(effective_start, effective_end)
+        result = pandas.Series(values, index=result_index)
+
+        # If query extended beyond chromosome, pad with fill_value
+        if effective_end < query_end:
+            padding_index = numpy.arange(effective_end, query_end)
+            padding = pandas.Series(
+                numpy.full(len(padding_index), self.fill_value),
+                index=padding_index
+            )
+            result = pandas.concat([result, padding])
+
+        return result
+
+    @property
+    def chromosomes(self) -> dict:
+        """
+        Return dictionary of chromosome names and sizes from the BigWig file.
+
+        Returns
+        -------
+        dict
+            Keys are chromosome names (in the BigWig file's dialect),
+            values are chromosome sizes in base pairs.
+        """
+        return dict(self._chromosome_sizes)
+
+    def __repr__(self) -> str:
+        """Return a string representation of this data source."""
+        return (
+            f"BigWigDataSource("
+            f"path='{self.bigwig_path}', "
+            f"dialect='{self.chromosome_dialect}', "
+            f"chromosomes={len(self._chromosome_sizes)})"
+        )
 
 
 class IntervalData:
