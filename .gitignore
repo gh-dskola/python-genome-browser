@@ -102,3 +102,15 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Secrets (org policy)
+.envrc
+.env.secret
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+
+# Claude Code local state
+.claude/plans/
+.claude/settings.local.json

@@ -1,0 +1,28 @@
+name: pygbrowse
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - python>=3.10
+
+  # Core dependencies
+  - numpy
+  - scipy
+  - pandas>=2.0
+  - matplotlib
+  - pysam
+  - intervaltree
+  - pybigwig
+
+  # bgzip / tabix command-line tools, handy for preparing GFF3 files by hand
+  - htslib
+
+  # Development dependencies
+  - pytest>=7.0
+  - ruff>=0.1.0
+
+  # Install the package in editable mode
+  - pip
+  - pip:
+      - -e .
