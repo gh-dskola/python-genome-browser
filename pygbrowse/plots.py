@@ -3,9 +3,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy
 import pandas
-import scipy
-import scipy.signal
-import seaborn
 from scipy import ndimage
 
 from . import utilities
@@ -288,9 +285,6 @@ class InteractionPlot(_BrowserSubPlot):
 
 class BedPlot(_BrowserSubPlot):
     DEFAULT_PATCH_KWARGS = {"linewidth": 1, "edgecolor": "k"}
-    CHROM_COL_NUM = 0
-    START_COL_NUM = 1
-    END_COL_NUM = 2
 
     def __init__(
         self,
@@ -305,26 +299,18 @@ class BedPlot(_BrowserSubPlot):
         pad_fraction=0.1,
         patch_kwargs=None,
     ):
-        """
-        Takes an iterable of tuples in the form:
+        super().__init__()
 
-        (name, DataFrame)
-
-        to be plotted in order using the .plot() method.
-        """
-        super(BedPlot, self).__init__()
-
-        self.interval_data = interval_data.data
+        self.interval_data = interval_data
         self.color = color
         self.pad_fraction = pad_fraction
 
+        columns = interval_data.data.columns
         self.color_by = color_by
         if self.color_by:
-            assert self.color_by in self.interval_data.columns, (
-                "Color-by column {} is not in the interval data!".format(self.color_by)
-            )
-            extent = numpy.abs(self.interval_data[self.color_by]).max()
-
+            if self.color_by not in columns:
+                raise ValueError(f"Color-by column {self.color_by!r} is not in the interval data")
+            extent = numpy.abs(interval_data.data[self.color_by]).max()
             self.color_mapper = matplotlib.cm.ScalarMappable(
                 norm=matplotlib.colors.Normalize(vmin=-extent, vmax=extent), cmap=cmap
             )
@@ -332,37 +318,24 @@ class BedPlot(_BrowserSubPlot):
             self.color_mapper = None
 
         self.display_value = display_value
-        if self.display_value:
-            assert self.display_value in self.interval_data.columns, (
-                "Display value column {} is not in the interval data!".format(self.display_value)
+        if self.display_value and self.display_value not in columns:
+            raise ValueError(
+                f"Display value column {self.display_value!r} is not in the interval data"
             )
         self.label = label
         self.patch_height = patch_height
-
         self.baseline = baseline
-        self.patch_kwargs = self.DEFAULT_PATCH_KWARGS
-        if patch_kwargs:
-            self.patch_kwargs.update(patch_kwargs)
+        self.patch_kwargs = {**self.DEFAULT_PATCH_KWARGS, **(patch_kwargs or {})}
 
     def plot(self, ax, chrom, ws, we, fig_width, row_height):
-        ylim = ax.get_ylim()
-        vert_span = ylim[1] - ylim[0]
-
         utilities.add_label(ax=ax, tick=self.baseline, tick_label=self.label, axis="y")
 
-        visible_intervals = self.interval_data.loc[
-            (self.interval_data.chrom == chrom)
-            & (
-                ((ws <= self.interval_data.chromStart) & (self.interval_data.chromStart <= we))
-                | ((ws <= self.interval_data.chromEnd) & (self.interval_data.chromEnd <= we))
-            )
-        ]
-
-        for interval_idx in range(visible_intervals.shape[0]):
-            this_interval = visible_intervals.iloc[interval_idx]
+        visible_intervals = self.interval_data.query(chrom, ws, we)
+        for _, this_interval in visible_intervals.iterrows():
             start_loc = this_interval["chromStart"]
             end_loc = this_interval["chromEnd"]
-            assert end_loc > start_loc, "interval end point must be greater than interval start!"
+            if end_loc <= start_loc:
+                raise ValueError(f"Interval end {end_loc} is not greater than start {start_loc}")
 
             if self.color_by:
                 interval_color = self.color_mapper.to_rgba(this_interval[self.color_by])
@@ -381,24 +354,14 @@ class BedPlot(_BrowserSubPlot):
                 ax.text(
                     x=(start_loc + end_loc) / 2,
                     y=self.baseline,
-                    s="{:>0.2}".format(this_interval[self.display_value]),
+                    s=f"{this_interval[self.display_value]:>0.2}",
                     ha="center",
                 )
 
-        utilities.adjust_limits(
-            ax=ax,
-            new_position=self.baseline + self.patch_height / 2,
-            axis="y",
-            padding_fraction=self.pad_fraction,
-        )
-        utilities.adjust_limits(
-            ax=ax,
-            new_position=self.baseline - self.patch_height / 2,
-            axis="y",
-            padding_fraction=self.pad_fraction,
-        )
-
-        # print(self.label, ax.get_yticks(), ax.get_yticklabels(), ax.get_ylim())
+        for edge in (self.baseline + self.patch_height / 2, self.baseline - self.patch_height / 2):
+            utilities.adjust_limits(
+                ax=ax, new_position=edge, axis="y", padding_fraction=self.pad_fraction
+            )
 
 
 class WigPlot(_BrowserSubPlot):
@@ -413,12 +376,8 @@ class WigPlot(_BrowserSubPlot):
         center_vector=False,
         scale_vector_to_plot=False,
         label_rotation=0,
-        # ylim=None,
-        smoothing_bandwidth=0,
     ):
-        super(
-            WigPlot, self
-        ).__init__()  # placeholder since currently the superclass constructor does nothing.
+        super().__init__()
         self.data = genomic_vector_data
         self.color = color
         self.solid = solid
@@ -426,35 +385,22 @@ class WigPlot(_BrowserSubPlot):
         self.center = center_vector
         self.scale_vector_to_plot = scale_vector_to_plot
         self.label = label
-
-        if smoothing_bandwidth:
-            self.convolution_kernel = utilities.gaussian_kernel(smoothing_bandwidth)
-        else:
-            self.convolution_kernel = None
-
         self.label_rotation = label_rotation
 
     def plot(self, ax, chrom, ws, we, fig_width, row_height):
         ylim = ax.get_ylim()
-
         vert_span = ylim[1] - ylim[0]
         vert_center = vert_span / 2 + ylim[0]
 
-        this_plot_vector = self.data[chrom].loc[ws:we]
-
-        if self.convolution_kernel is not None:
-            this_plot_vector = pandas.Series(
-                scipy.signal.convolve(this_plot_vector, self.convolution_kernel, mode="same"),
-                index=this_plot_vector.index,
-            )
+        # astype returns a copy, so scaling below never writes into the data source.
+        this_plot_vector = self.data[chrom].loc[ws:we].astype(float)
 
         if self.scale_vector_to_plot:
-            this_plot_vector /= this_plot_vector.max() - this_plot_vector.min()
-            this_plot_vector *= vert_span
-
+            this_plot_vector = (
+                this_plot_vector / (this_plot_vector.max() - this_plot_vector.min()) * vert_span
+            )
         if self.center:
-            this_plot_vector -= this_plot_vector.mean()
-            this_plot_vector += vert_center
+            this_plot_vector = this_plot_vector - this_plot_vector.mean() + vert_center
 
         this_plot_vector = this_plot_vector.loc[
             (this_plot_vector.index >= ws) & (this_plot_vector.index < we)
@@ -480,7 +426,6 @@ class WigPlot(_BrowserSubPlot):
 
         ax.autoscale(enable=True, axis="y")
 
-        # ToDo: Allow labeling either by ylabel or by ax.legend
         if self.label:
             ax.set_ylabel(self.label, rotation=self.label_rotation, labelpad=DEFAULT_YLABEL_PAD)
 
@@ -498,13 +443,11 @@ class GeneModelPlot(_BrowserSubPlot):
         truncation_size=0.10,
         utr_endcap_width=0.04,
         gene_name_fontsize=8,
-        genes_include=[],
+        genes_include=None,
     ):
-
-        super(GeneModelPlot, self).__init__()
+        super().__init__()
 
         self.gene_annotation_data = gene_annotation_data
-
         self.color = color
         self.label = label
         self.feature_height = feature_height  # in inches
@@ -514,7 +457,7 @@ class GeneModelPlot(_BrowserSubPlot):
         self.truncation_size = truncation_size  # in inches
         self.utr_endcap_width = utr_endcap_width  # in inches
         self.gene_name_fontsize = gene_name_fontsize
-        self.genes_include = genes_include  # the list of genes to be included in plot
+        self.genes_include = set(genes_include or [])
 
     @staticmethod
     def _arrange_genes(gene_data_list):
@@ -525,306 +468,142 @@ class GeneModelPlot(_BrowserSubPlot):
         """
         gene_data_list = sorted(gene_data_list, key=lambda x: x["end"] - x["start"], reverse=True)
 
-        display_levels = [
-            intervaltree.IntervalTree(),
-        ]
-
+        display_levels = [intervaltree.IntervalTree()]
         for gene_data in gene_data_list:
-            found_home = False
             level_idx = 0
-            while not found_home:
-                if level_idx >= len(display_levels):
+            while display_levels[level_idx].overlaps(gene_data["start"], gene_data["end"]):
+                level_idx += 1
+                if level_idx == len(display_levels):
                     display_levels.append(intervaltree.IntervalTree())
-                if display_levels[level_idx].overlaps(gene_data["start"], gene_data["end"]):
-                    level_idx += 1
-                else:
-                    display_levels[level_idx].addi(
-                        gene_data["start"], gene_data["end"], data=gene_data
-                    )
-                    found_home = True
+            display_levels[level_idx].addi(gene_data["start"], gene_data["end"], data=gene_data)
 
-        return [
-            [gene_interval.data["ID"] for gene_interval in this_level]
-            for this_level in display_levels
-        ]
+        return [[gene_interval.data["ID"] for gene_interval in level] for level in display_levels]
+
+    def _sizes_in_data_units(self, ax, ws, we, fig_width, row_height):
+        """Convert the inch-valued glyph sizes to data coordinates for this window and row."""
+        x_per_inch = (we - ws) / fig_width
+        y_per_inch = (ax.get_ylim()[1] - ax.get_ylim()[0]) / row_height
+        return {
+            "chevron_spacing": self.chevron_spacing * x_per_inch,
+            "chevron_width": self.chevron_width * x_per_inch,
+            "truncation_width": self.truncation_size * x_per_inch,
+            "utr_endcap_width": self.utr_endcap_width * x_per_inch,
+            "feature_height": self.feature_height * y_per_inch,
+            "chevron_height": self.chevron_height * y_per_inch,
+            "truncation_height": self.truncation_size * y_per_inch,
+        }
 
     def plot(self, ax, chrom, ws, we, fig_width, row_height):
-        # find overlapping genes
-        overlapping_genes, overlapping_transcripts, overlapping_components, ids_to_names = (
-            self.gene_annotation_data.query(chrom, ws, we)
-        )
-        # overlapping_genes = self.genes.overlapping(chrom, ws, we)
-        # overlapping_components = self.components.overlapping(chrom, ws, we)
+        genes, transcripts, components, _ = self.gene_annotation_data.query(chrom, ws, we)
+        if self.genes_include:
+            genes = {
+                gene_id: gene for gene_id, gene in genes.items()
+                if gene["Name"] in self.genes_include
+            }
 
-        gene_display_levels = self._arrange_genes(overlapping_genes.values())
-        ax.set_ylim((-0.5, len(gene_display_levels) - 1 + 0.5))
+        gene_display_levels = self._arrange_genes(genes.values())
+        ax.set_ylim((-0.5, len(gene_display_levels) - 0.5))
+        sizes = self._sizes_in_data_units(ax, ws, we, fig_width, row_height)
 
-        # convert inches to data coordinates
-        chevron_spacing_dt = (we - ws) / (fig_width / self.chevron_spacing)
-        chevron_width_dt = (we - ws) / (fig_width / self.chevron_width)
-        truncation_width_dt = (we - ws) / (fig_width / self.truncation_size)
-        utr_endcap_width_dt = (we - ws) / (fig_width / self.utr_endcap_width)
-
-        feature_height_dt = (ax.get_ylim()[1] - ax.get_ylim()[0]) / (
-            row_height / self.feature_height
-        )
-        chevron_height_dt = (ax.get_ylim()[1] - ax.get_ylim()[0]) / (
-            row_height / self.chevron_height
-        )
-        truncation_height_dt = (ax.get_ylim()[1] - ax.get_ylim()[0]) / (
-            row_height / self.truncation_size
-        )
-
-        for gene_num, level_genes in enumerate(gene_display_levels):
-            # ToDo: make this universal. Divide the gene body into non-overlapping segments, each type of which has a template.
-
-            for gene_id in level_genes:
-                gene_data = overlapping_genes[gene_id]
-                #                 print(gene_id, gene_data['Name'])
-                if len(self.genes_include) > 0 and (
-                    not any(gene_data["Name"] in s for s in self.genes_include)
-                ):
-                    continue
-
-                left_truncated = gene_data["start"] < ws
-                right_truncated = gene_data["end"] > we
-
-                visible_gene_start = max(gene_data["start"], ws)
-                if left_truncated:
-                    visible_gene_start += truncation_width_dt * 2
-                visible_gene_end = min(gene_data["end"], we)
-                if right_truncated:
-                    visible_gene_end -= truncation_width_dt * 2
-
-                ax.plot(
-                    (visible_gene_start, visible_gene_end), (gene_num, gene_num), color=self.color
-                )
-                ax.text(
-                    x=(visible_gene_start + visible_gene_end) / 2,
-                    y=gene_num + feature_height_dt * 1.5,
-                    s=gene_data["Name"],
-                    ha="center",
-                    fontsize=self.gene_name_fontsize,
-                )
-
-                num_chevrons = int(
-                    max((visible_gene_end - visible_gene_start) / chevron_spacing_dt, 1)
-                )
-                chevron_remainder = (visible_gene_end - visible_gene_start) - (
-                    num_chevrons - 1
-                ) * chevron_spacing_dt
-
-                if gene_data["strand"] == "+":
-                    chevron_x_delta = -chevron_width_dt
-                else:
-                    chevron_x_delta = chevron_width_dt
-
-                for chevron_idx in range(num_chevrons):
-                    chevron_x = (
-                        visible_gene_start
-                        + chevron_idx * chevron_spacing_dt
-                        + chevron_remainder / 2
-                    )
-
-                    ax.plot(
-                        (chevron_x, chevron_x + chevron_x_delta),
-                        (gene_num, gene_num + chevron_height_dt),
-                        color=self.color,
-                    )
-                    ax.plot(
-                        (chevron_x, chevron_x + chevron_x_delta),
-                        (gene_num, gene_num - chevron_height_dt),
-                        color=self.color,
-                    )
-
-                if left_truncated:
-                    y_points = [
-                        gene_num,
-                        gene_num - truncation_height_dt,
-                        gene_num + truncation_height_dt,
-                    ]
-                    left_x_point = ws + 1
-                    right_x_point = ws + truncation_width_dt + 1
-
-                    x_points = numpy.array([left_x_point, right_x_point, right_x_point])
-
-                    larr1 = matplotlib.patches.Polygon(
-                        numpy.vstack([x_points, y_points]).T,
-                        edgecolor="k",
-                        facecolor="w",
-                        fill=True,
-                        transform=ax.transData,
-                        zorder=3,
-                    )
-                    larr2 = matplotlib.patches.Polygon(
-                        numpy.vstack([x_points + truncation_width_dt, y_points]).T,
-                        edgecolor="k",
-                        facecolor="w",
-                        fill=True,
-                        transform=ax.transData,
-                        zorder=3,
-                    )
-
-                    ax.add_patch(larr1)
-                    ax.add_patch(larr2)
-
-                if right_truncated:
-                    y_points = [
-                        gene_num,
-                        gene_num - truncation_height_dt,
-                        gene_num + truncation_height_dt,
-                    ]
-                    left_x_point = we - truncation_width_dt - 1
-                    right_x_point = we - 1
-
-                    x_points = numpy.array([right_x_point, left_x_point, left_x_point])
-
-                    rarr1 = matplotlib.patches.Polygon(
-                        xy=numpy.vstack([x_points, y_points]).T,
-                        edgecolor="k",
-                        facecolor="w",
-                        fill=True,
-                        transform=ax.transData,
-                        zorder=3,
-                    )
-                    rarr2 = matplotlib.patches.Polygon(
-                        numpy.vstack([x_points - truncation_width_dt, y_points]).T,
-                        edgecolor="k",
-                        facecolor="w",
-                        fill=True,
-                        transform=ax.transData,
-                        zorder=3,
-                    )
-                    ax.add_patch(rarr1)
-                    ax.add_patch(rarr2)
-
-                # Identify components belonging to this gene
-                # this_gene_components = set([])
-                # for transcript_id in gene_data['transcripts']:
-                #     for component_id in overlapping_components:
-                #         this_gene_components.add(component_id)
-
-                # plot components
-                for component_id in overlapping_components:
-                    component_data = overlapping_components[component_id]
-                    #                     print('\t', component_id, component_data)
-                    if (
-                        (component_data["start"] >= visible_gene_start)
-                        and (component_data["start"] <= visible_gene_end)
-                    ) or (
-                        (component_data["end"] >= visible_gene_start)
-                        and (component_data["end"] <= visible_gene_end)
-                    ):
-                        # ToDo: systematize and condense the following:
-                        if component_data["type"] == "five_prime_UTR":
-                            # plot the "body" of the UTR
-                            if gene_data["strand"] == "+":
-                                utr_body = matplotlib.patches.Rectangle(
-                                    xy=(component_data["start"], gene_num - feature_height_dt / 2),
-                                    width=max(
-                                        component_data["end"]
-                                        - component_data["start"]
-                                        - utr_endcap_width_dt,
-                                        0,
-                                    ),
-                                    height=feature_height_dt,
-                                    facecolor=self.color,
-                                )
-                                utr_endcap = matplotlib.patches.Rectangle(
-                                    xy=(
-                                        component_data["end"] - utr_endcap_width_dt,
-                                        gene_num - feature_height_dt,
-                                    ),
-                                    width=utr_endcap_width_dt,
-                                    height=feature_height_dt * 2,
-                                    facecolor=self.color,
-                                )
-
-                            else:
-                                utr_body = matplotlib.patches.Rectangle(
-                                    xy=(
-                                        component_data["start"] + utr_endcap_width_dt,
-                                        gene_num - feature_height_dt / 2,
-                                    ),
-                                    width=max(
-                                        component_data["end"]
-                                        - component_data["start"]
-                                        - utr_endcap_width_dt,
-                                        0,
-                                    ),
-                                    height=feature_height_dt,
-                                    facecolor=self.color,
-                                )
-                                utr_endcap = matplotlib.patches.Rectangle(
-                                    xy=(component_data["start"], gene_num - feature_height_dt),
-                                    width=utr_endcap_width_dt,
-                                    height=feature_height_dt * 2,
-                                    facecolor=self.color,
-                                )
-
-                            ax.add_patch(utr_body)
-                            ax.add_patch(utr_endcap)
-
-                        elif component_data["type"] == "three_prime_UTR":
-                            # plot the "body" of the UTR
-                            if gene_data["strand"] == "-":
-                                utr_body = matplotlib.patches.Rectangle(
-                                    xy=(component_data["start"], gene_num - feature_height_dt / 2),
-                                    width=max(
-                                        component_data["end"]
-                                        - component_data["start"]
-                                        - utr_endcap_width_dt,
-                                        0,
-                                    ),
-                                    height=feature_height_dt,
-                                    facecolor=self.color,
-                                )
-                                utr_endcap = matplotlib.patches.Rectangle(
-                                    xy=(
-                                        component_data["end"] - utr_endcap_width_dt,
-                                        gene_num - feature_height_dt,
-                                    ),
-                                    width=utr_endcap_width_dt,
-                                    height=feature_height_dt * 2,
-                                    facecolor=self.color,
-                                )
-
-                            else:
-                                utr_body = matplotlib.patches.Rectangle(
-                                    xy=(
-                                        component_data["start"] + utr_endcap_width_dt,
-                                        gene_num - feature_height_dt / 2,
-                                    ),
-                                    width=max(
-                                        component_data["end"]
-                                        - component_data["start"]
-                                        - self.utr_endcap_width,
-                                        0,
-                                    ),
-                                    height=feature_height_dt,
-                                    facecolor=self.color,
-                                )
-                                utr_endcap = matplotlib.patches.Rectangle(
-                                    xy=(component_data["start"], gene_num - feature_height_dt),
-                                    width=utr_endcap_width_dt,
-                                    height=feature_height_dt * 2,
-                                    facecolor=self.color,
-                                )
-
-                            ax.add_patch(utr_body)
-                            ax.add_patch(utr_endcap)
-
-                        elif component_data["type"] == "CDS":
-                            cds = matplotlib.patches.Rectangle(
-                                xy=(component_data["start"], gene_num - feature_height_dt),
-                                width=component_data["end"] - component_data["start"],
-                                height=feature_height_dt * 2,
-                                facecolor=self.color,
-                            )
-                            ax.add_patch(cds)
+        for level, level_gene_ids in enumerate(gene_display_levels):
+            for gene_id in level_gene_ids:
+                gene = genes[gene_id]
+                self._draw_gene_body(ax, gene, level, ws, we, sizes)
+                component_ids = {
+                    component_id
+                    for transcript_id in gene["transcripts"]
+                    for component_id in transcripts[transcript_id]["components"]
+                }
+                for component_id in sorted(component_ids):
+                    self._draw_component(ax, components[component_id], gene["strand"], level, sizes)
 
         ax.set_yticks([])
         ax.set_ylabel(self.label)
+
+    def _draw_gene_body(self, ax, gene, level, ws, we, sizes):
+        """Draw the backbone, name, strand chevrons and truncation marks of one gene."""
+        left_truncated = gene["start"] < ws
+        right_truncated = gene["end"] > we
+        visible_start = max(gene["start"], ws) + left_truncated * sizes["truncation_width"] * 2
+        visible_end = min(gene["end"], we) - right_truncated * sizes["truncation_width"] * 2
+
+        ax.plot((visible_start, visible_end), (level, level), color=self.color)
+        ax.text(
+            x=(visible_start + visible_end) / 2,
+            y=level + sizes["feature_height"] * 1.5,
+            s=gene["Name"],
+            ha="center",
+            fontsize=self.gene_name_fontsize,
+        )
+
+        span = visible_end - visible_start
+        num_chevrons = int(max(span / sizes["chevron_spacing"], 1))
+        chevron_remainder = span - (num_chevrons - 1) * sizes["chevron_spacing"]
+        chevron_dx = -sizes["chevron_width"] if gene["strand"] == "+" else sizes["chevron_width"]
+        for chevron_idx in range(num_chevrons):
+            chevron_x = (
+                visible_start + chevron_idx * sizes["chevron_spacing"] + chevron_remainder / 2
+            )
+            for chevron_dy in (sizes["chevron_height"], -sizes["chevron_height"]):
+                ax.plot(
+                    (chevron_x, chevron_x + chevron_dx),
+                    (level, level + chevron_dy),
+                    color=self.color,
+                )
+
+        if left_truncated:
+            self._draw_truncation_marks(ax, level, edge_x=ws, direction=1, sizes=sizes)
+        if right_truncated:
+            self._draw_truncation_marks(ax, level, edge_x=we, direction=-1, sizes=sizes)
+
+    @staticmethod
+    def _draw_truncation_marks(ax, level, edge_x, direction, sizes):
+        """Draw two arrowheads pointing off the window edge (direction +1 = left edge)."""
+        width, height = sizes["truncation_width"], sizes["truncation_height"]
+        tip_x = edge_x + direction
+        base_x = edge_x + direction * (width + 1)
+        x_points = numpy.array([tip_x, base_x, base_x])
+        y_points = [level, level - height, level + height]
+        for shift in (0, direction * width):
+            ax.add_patch(
+                matplotlib.patches.Polygon(
+                    numpy.vstack([x_points + shift, y_points]).T,
+                    edgecolor="k",
+                    facecolor="w",
+                    fill=True,
+                    transform=ax.transData,
+                    zorder=3,
+                )
+            )
+
+    def _draw_component(self, ax, component, strand, level, sizes):
+        """Draw a CDS as a full-height box, or a UTR as a half-height box with an endcap.
+
+        The endcap sits on the UTR side next to the CDS: the right side for a + strand 5' UTR
+        or a - strand 3' UTR, the left side otherwise.
+        """
+        start, end = component["start"], component["end"]
+        feature_height = sizes["feature_height"]
+        if component["type"] == "CDS":
+            boxes = [(start, end - start, feature_height * 2)]
+        else:
+            cap_width = min(sizes["utr_endcap_width"], end - start)
+            cap_on_right = (component["type"] == "five_prime_UTR") == (strand == "+")
+            body_start = start if cap_on_right else start + cap_width
+            cap_start = end - cap_width if cap_on_right else start
+            boxes = [
+                (body_start, end - start - cap_width, feature_height),
+                (cap_start, cap_width, feature_height * 2),
+            ]
+        for box_start, box_width, box_height in boxes:
+            ax.add_patch(
+                matplotlib.patches.Rectangle(
+                    xy=(box_start, level - box_height / 2),
+                    width=box_width,
+                    height=box_height,
+                    facecolor=self.color,
+                )
+            )
 
 
 def compute_figure_height(row_heights: list[float], ax_spacing: float) -> float:
@@ -875,15 +654,45 @@ def compute_ax_row_positions(
     return bottoms, heights
 
 
+# Track style, formerly applied globally through seaborn.set_style("ticks").
+DEFAULT_STYLE = {
+    "figure.facecolor": "white",
+    "axes.labelcolor": ".15",
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "xtick.color": ".15",
+    "ytick.color": ".15",
+    "axes.axisbelow": True,
+    "grid.linestyle": "-",
+    "text.color": ".15",
+    "font.family": ["sans-serif"],
+    "font.sans-serif": ["Arial", "DejaVu Sans", "Liberation Sans", "Bitstream Vera Sans", "sans-serif"],
+    "lines.solid_capstyle": "round",
+    "patch.edgecolor": "w",
+    "patch.force_edgecolor": True,
+    "xtick.top": False,
+    "ytick.right": False,
+    "axes.grid": False,
+    "axes.facecolor": "#EAEAF2",
+    "axes.edgecolor": "w",
+    "grid.color": ".8",
+    "axes.spines.left": True,
+    "axes.spines.bottom": True,
+    "axes.spines.right": True,
+    "axes.spines.top": True,
+    "xtick.bottom": True,
+    "ytick.left": True,
+}
+
+
 class GenomeBrowser:
-    VECTOR_LEGEND_LOC = 0
-
     def __init__(self, subplot_objects):
-        """
-        Given a 2D nested list of genomic subplot objects it will allow the user to call the .visualize() method
-        to generate plots of genomic data.
+        """Stack genomic tracks into one figure.
 
-        :param plot_objects:
+        Parameters
+        ----------
+        subplot_objects : list of list of _BrowserSubPlot
+            One inner list per row, top to bottom. Every track in a row draws on the same Axes.
         """
         self.subplot_objects = subplot_objects
 
@@ -896,104 +705,88 @@ class GenomeBrowser:
         row_heights=1,
         ax_spacing=0.05,
         num_xticks=10,
-        seaborn_style=seaborn.axes_style(
-            style="ticks", rc={"axes.edgecolor": "w", "axes.facecolor": "#EAEAF2"}
-        ),
+        style=None,
     ):
+        """Draw every row for one genomic window and return the figure.
+
+        Parameters
+        ----------
+        chrom : str
+            Chromosome, UCSC style (``chr1``).
+        start, end : int
+            Window, 0-based half-open.
+        fig_width : float
+            Figure width in inches.
+        row_heights : float or list of float
+            Row height in inches, one value for all rows or one per row.
+        ax_spacing : float
+            Gap below each row, as a fraction of the summed row heights.
+        num_xticks : int
+            Approximate number of x ticks on the bottom row.
+        style : dict, optional
+            matplotlib rcParams that override ``DEFAULT_STYLE`` for this figure only.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            A new figure with one Axes per row.
         """
-        Generate, display and return a matplotlib.Figure object comprising one or more Axes representing the genomic
-        data tracks specified at initialization.
-
-        The region to plot is specified by the parameters chrom, start, and end.
-
-        :param:`fig_width` is specified in inches
-
-        :param:`row_heights` can be specified as a scalar value (in inches), in which case the same row height will be
-        used for all subplots, or as an iterable, in which case the row heights will be applied to the subplots
-        in order.
-
-        :param chrom:
-        :param start:
-        :param end:
-        :param fig_width:
-        :param row_heights:
-        :param ax_spacing:
-        :param num_xticks:
-        :param seaborn_style:
-        :return:
-        """
-        # ToDo: Add gene (or other feature) lookup instead of specifying coordinates.
         start, end = int(start), int(end)
+        if end <= start:
+            raise ValueError(f"Window end must be greater than window start; got {start}, {end}")
 
-        assert end > start, "Window end must be greater than window start! Got: {}, {}".format(
-            start, end
-        )
+        if numpy.ndim(row_heights) == 0:
+            row_heights = [row_heights] * len(self.subplot_objects)
+        if len(row_heights) != len(self.subplot_objects):
+            raise ValueError(
+                f"Got {len(row_heights)} row heights for {len(self.subplot_objects)} rows"
+            )
 
-        # if we receive a scalar here, use it as the height for all rows
-        try:
-            if len(row_heights) == 1:
-                row_heights = row_heights * len(
-                    self.subplot_objects
-                )  # treat as a uniform row height
-        except TypeError:
-            row_heights = [row_heights] * len(self.subplot_objects)  # treat as a uniform row height
+        with matplotlib.rc_context(rc={**DEFAULT_STYLE, **(style or {})}):
+            fig = plt.figure(
+                figsize=(
+                    fig_width,
+                    compute_figure_height(row_heights=row_heights, ax_spacing=ax_spacing),
+                )
+            )
+            bottoms, heights = compute_ax_row_positions(
+                row_heights=row_heights, ax_spacing=ax_spacing
+            )
+            for row_idx, row_subplots in enumerate(self.subplot_objects):
+                row_ax = fig.add_axes([0, bottoms[row_idx], 1, heights[row_idx]])
+                self._set_x_axis(row_ax, chrom, start, end, num_xticks, row_idx)
+                # Default limits; tracks may change them.
+                row_ax.set_ylim(0, 1)
+                row_ax.set_xlim(start, end)
+                for subplot in row_subplots:
+                    subplot.plot(
+                        row_ax,
+                        chrom=chrom,
+                        ws=start,
+                        we=end,
+                        fig_width=fig_width,
+                        row_height=row_heights[row_idx],
+                    )
+        return fig
 
-        assert len(row_heights) == len(self.subplot_objects)
-
+    def _set_x_axis(self, ax, chrom, start, end, num_xticks, row_idx):
+        """Label genomic positions on the bottom row and clear x ticks on the others."""
+        if row_idx < len(self.subplot_objects) - 1:
+            ax.set_xlabel("")
+            ax.set_xticks([])
+            return
         span = end - start
         xtick_increment = span / num_xticks
         rounding_increment = 5 * 10 ** numpy.round(numpy.log10(xtick_increment) - 1)
         xtick_increment = utilities.roundto(xtick_increment, rounding_increment)
         num_ticks = int(span / xtick_increment) + 1
         round_start = utilities.roundto(start, rounding_increment)
-
-        seaborn.set_style(seaborn_style)
-
-        fig = plt.figure(
-            len(self.subplot_objects),
-            figsize=(
-                fig_width,
-                compute_figure_height(row_heights=row_heights, ax_spacing=ax_spacing),
-            ),
-        )
-        bottoms, heights = compute_ax_row_positions(row_heights=row_heights, ax_spacing=ax_spacing)
-
-        for ax_idx in range(len(self.subplot_objects)):
-            this_ax = fig.add_axes([0, bottoms[ax_idx], 1, heights[ax_idx]])
-
-            if ax_idx == len(self.subplot_objects) - 1:
-                this_ax.set_xticks(numpy.arange(num_ticks) * xtick_increment + round_start)
-                this_ax.ticklabel_format(axis="x", style="sci", scilimits=(-2, 2))
-                this_ax.set_xlabel("{} position".format(chrom))
-
-            else:  # clear out xticks but plot objects can override this later
-                this_ax.set_xlabel("")
-                this_ax.set_xticks([])
-
-            plot_object_subset = self.subplot_objects[ax_idx]
-
-            # Set default plot limits (can be changed by client objects)
-            this_ax.set_ylim(0, 1)
-            this_ax.set_xlim(start, end)
-
-            for plot_object in plot_object_subset:
-                plot_object.plot(
-                    this_ax,
-                    chrom=chrom,
-                    ws=start,
-                    we=end,
-                    fig_width=fig_width,
-                    row_height=row_heights[ax_idx],
-                )
-
-            # ToDo: Refactor legend code to get colors and names from objects not from axes handles.
-            # if len(this_ax.get_legend_handles_labels()[1]):
-            #     this_ax.legend(loc=self.VECTOR_LEGEND_LOC)
-
-        return fig
+        ax.set_xticks(numpy.arange(num_ticks) * xtick_increment + round_start)
+        ax.ticklabel_format(axis="x", style="sci", scilimits=(-2, 2))
+        ax.set_xlabel(f"{chrom} position")
 
 
-class HicPlot:
+class HicPlot(_BrowserSubPlot):
     def __init__(
         self,
         data,
@@ -1004,9 +797,10 @@ class HicPlot:
         transform=lambda x: x**2,
         max_masked_diag=2,
     ):
+        super().__init__()
         self.data = data
         self.cmap = cmap
-        self.transform = transform  # ToDo: Move the transform to the Data provider
+        self.transform = transform
         self.max_masked_diag = max_masked_diag
         self.label = label
         self.label_rotation = label_rotation
@@ -1020,35 +814,27 @@ class HicPlot:
         data_start_bin = visible_start_bin - visible_span // 2
         data_end_bin = visible_end_bin + visible_span // 2
 
-        plot_data = self.data.query(chrom, data_start_bin, data_end_bin)
-
-        for diag in range(self.max_masked_diag):
-            plot_data.values[utilities.diag_indices(plot_data.shape[0], diag)] = 0
+        queried = self.data.query(chrom, data_start_bin, data_end_bin)
+        matrix = queried.to_numpy(dtype=float, copy=True)
+        row_idx, col_idx = numpy.indices(matrix.shape)
+        matrix[numpy.abs(row_idx - col_idx) < self.max_masked_diag] = 0
 
         plot_data = pandas.DataFrame(
-            ndimage.rotate(plot_data, 45, reshape=False),
-            index=plot_data.index,
-            columns=plot_data.columns,
+            ndimage.rotate(matrix, 45, reshape=False),
+            index=queried.index,
+            columns=queried.columns,
         )
-        #         print(plot_data.shape)
-
-        # Trim back to visible area
-        plot_data = plot_data.loc[
-            visible_start_bin:visible_end_bin, visible_start_bin:visible_end_bin
-        ]
-
-        # Only show upper diagonal
+        plot_data = plot_data.loc[visible_start_bin:visible_end_bin, visible_start_bin:visible_end_bin]
+        # Rotated 45 degrees, the upper half of the rows holds the upper triangle.
         plot_data = plot_data.iloc[: -plot_data.shape[0] // 2, :]
-
         plot_data = self.transform(plot_data)
 
-        # Re-index plot_data to allow it to play nicely with ax limits
-
         ax.set_ylim(0, plot_data.shape[1])
-        ax.imshow(plot_data, cmap=self.cmap, aspect="auto", extent=(ws, we, 0, plot_data.shape[1]))
+        ax.imshow(
+            plot_data, cmap=self.cmap, aspect="auto", extent=(ws, we, 0, plot_data.shape[1])
+        )
         ax.set_xticks([])
         ax.set_ylabel(self.label, rotation=self.label_rotation, labelpad=DEFAULT_YLABEL_PAD)
-        #         print('Done on {}'.format(ax))
         return plot_data
 
 

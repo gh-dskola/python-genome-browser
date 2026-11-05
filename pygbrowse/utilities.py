@@ -1,9 +1,15 @@
 import datetime
+import gzip
+import logging
 import os
-import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy
+import pysam
 from scipy.stats import norm
+
+logger = logging.getLogger(__name__)
 
 
 # ToDo: Bring back scale bar
@@ -60,124 +66,111 @@ def convert_chromosome_name(chrom_string: str, dialect: str = "ucsc") -> str:
     raise ValueError(f"Unknown dialect {dialect!r}; expected 'ucsc', 'ensembl' or 'yeast'")
 
 
-def binary_search_tag_file(tag_filename, search_target):
+def binary_search_tag_file(tag_fpath: str | Path, search_target: int) -> int | None:
+    """Find the first tag in a sorted HOMER tag file whose start is >= ``search_target``.
+
+    Parameters
+    ----------
+    tag_fpath : str or Path
+        HOMER ``<chrom>.tags.tsv`` file, sorted by start. Column 2 holds the 1-based start.
+    search_target : int
+        1-based position to search for.
+
+    Returns
+    -------
+    int or None
+        Byte offset of the start of that tag's line, or None if every tag starts before
+        ``search_target``.
     """
-    Find the offset (in bytes) in :param:`tag_filename` that corresponds
-    to the start of the first tag that is equal to or greater than :param:`search_target`.
+    with open(tag_fpath, "rb") as tag_file:
 
-    If none of the reads have a start position greater than :param:`search_target`,
-    return None.
+        def first_line_from(offset: int) -> tuple[int, bytes]:
+            """Return the offset and content of the first line starting at or after offset."""
+            tag_file.seek(max(offset - 1, 0))
+            if offset > 0:
+                tag_file.readline()
+            return tag_file.tell(), tag_file.readline()
 
-    Note that positions in tag files have a 1-based index.
-    """
-
-    def get_read_start(file_offset):
-        tag_file.seek(file_offset)
-        if file_offset > 0:
-            _ = tag_file.readline()  # read forward to get to a line start
-        this_line = tag_file.readline().strip()
-        if tag_file.tell() >= filesize:
-            # We've reached the end of the file and the reads are still upstream of the target
-            return None
-        else:
-            return int(this_line.split("\t")[1])
-
-    filesize = os.path.getsize(tag_filename)
-    search_window_start = 0
-    search_window_end = filesize - 1
-    guess_genomic_start = -1
-    guess = int((search_window_start + search_window_end) / 2)
-
-    with open(tag_filename, "rt") as tag_file:
-        first_genomic_start = get_read_start(search_window_start)
-        # last_genomic_start = get_read_position(search_window_end)
-
-        if search_target < first_genomic_start:
-            return search_window_start
-
-        while search_window_end - search_window_start > 1:
-            guess = int((search_window_start + search_window_end) / 2)
-            guess_genomic_start = get_read_start(guess)
-
-            if guess_genomic_start == None:
-                return None
-
-            # print(search_window_start, guess, search_window_end, guess_genomic_start)
-
-            if guess_genomic_start < search_target:
-                # print('\ttoo low!')
-                search_window_start = guess
-
-            elif guess_genomic_start > search_target:
-                search_window_end = guess
-
-                # print('\ttoo high!')
+        low, high = 0, os.path.getsize(tag_fpath)
+        while low < high:
+            middle = (low + high) // 2
+            _, line = first_line_from(middle)
+            if not line or int(line.split(b"\t")[1]) >= search_target:
+                high = middle
             else:
-                # print('\tjust right!')
-                break
-
-        if guess_genomic_start == -1:
-            return None
-
-        if guess_genomic_start < search_target:
-            guess += 1
-
-        tag_file.seek(guess)
-        _ = tag_file.readline()
-        guess = tag_file.tell()
-
-        return guess
+                low = middle + 1
+        line_offset, line = first_line_from(low)
+        return line_offset if line else None
 
 
-def bgzip_gff(gff3_fname, bgzipped_fname):
+def _gff3_sort_key(line: str) -> tuple[str, int]:
+    """Sort GFF3 rows like ``sort -k1,1 -k4,4n``: contig, then numeric start."""
+    fields = line.split("\t", 4)
+    return fields[0], int(fields[3])
+
+
+def bgzip_gff(gff3_fpath: str | Path, bgzipped_fpath: str | Path) -> Path:
+    """Sort a GFF3 file by contig and start, and write it block-gzipped.
+
+    Parameters
+    ----------
+    gff3_fpath : str or Path
+        Input GFF3; read as gzip if the name ends in ``.gz``, otherwise as plain text.
+    bgzipped_fpath : str or Path
+        Output path for the sorted, block-gzipped GFF3. Overwritten if it exists.
+
+    Returns
+    -------
+    Path
+        ``bgzipped_fpath``.
+
+    Raises
+    ------
+    ValueError
+        If input and output are the same file.
+    FileNotFoundError
+        If ``gff3_fpath`` does not exist.
     """
-    Compress a GFF3 file in block-gzip format (requires that bgzip be accessible on the current path).
+    gff3_fpath, bgzipped_fpath = Path(gff3_fpath), Path(bgzipped_fpath)
+    if gff3_fpath.resolve() == bgzipped_fpath.resolve():
+        raise ValueError(f"Source and destination are the same file: {gff3_fpath}")
+    if not gff3_fpath.is_file():
+        raise FileNotFoundError(f"GFF3 file not found: {gff3_fpath}")
 
-    If :param gff3_fname: ends with '.gz' assumes that the file is gzipped, otherwise assumes it is uncompressed.
-
-    :param gzipped_fname:
-    :param bgzipped_fname:
-    :return:
-    """
-    if bgzipped_fname == gff3_fname:
-        log_print("Destination and source file cannot have the same name!")
-
-    cmd_line = "{} {} | sort -k1,1 -k4,4n | bgzip > {}".format(
-        ("cat", "zcat")[gff3_fname.endswith(".gz")], gff3_fname, bgzipped_fname
+    opener = gzip.open if gff3_fpath.suffix == ".gz" else open
+    # ponytail: holds the whole GFF3 in memory; stream through `sort` if that ever runs out.
+    with opener(gff3_fpath, "rt") as gff3_file:
+        lines = gff3_file.readlines()
+    header_lines = [line for line in lines if line.startswith("#")]
+    feature_lines = sorted(
+        (line for line in lines if line.strip() and not line.startswith("#")), key=_gff3_sort_key
     )
-    try:
-        assert os.path.isfile(gff3_fname)  # needed since no error occurs otherwise
-        subprocess.check_call(cmd_line, shell=True)
+    logger.info("Read %d feature lines from %s", len(feature_lines), gff3_fpath)
 
-    except subprocess.CalledProcessError as cpe:
-        log_print("Unsuccessful. Got return code {}".format(cpe.returncode))
-
-    except AssertionError:
-        log_print("{} not found!".format(gff3_fname))
-
-    else:
-        log_print(
-            "Successfully generated block-gzipped file {} from {}".format(
-                bgzipped_fname, gff3_fname
-            )
-        )
+    with tempfile.TemporaryDirectory(dir=bgzipped_fpath.parent) as scratch_path:
+        sorted_fpath = Path(scratch_path) / "sorted.gff3"
+        sorted_fpath.write_text("".join(header_lines + feature_lines))
+        pysam.tabix_compress(str(sorted_fpath), str(bgzipped_fpath), force=True)
+    logger.info("Wrote sorted, block-gzipped GFF3 to %s", bgzipped_fpath)
+    return bgzipped_fpath
 
 
-def generate_tabix_index(target_fname):
+def generate_tabix_index(target_fpath: str | Path) -> Path:
+    """Build a tabix index (``.tbi``) next to a block-gzipped, sorted GFF3 file.
+
+    Parameters
+    ----------
+    target_fpath : str or Path
+        Block-gzipped GFF3, e.g. the output of ``bgzip_gff``. Its directory must be writeable.
+
+    Returns
+    -------
+    Path
+        The indexed file.
     """
-    Index :param target_fname: with tabix. Requires that the directory in which :param:target_fname: resides is
-    writeable.
-
-    :param target_fname:
-    :return:
-    """
-    cmd_line = "tabix -f -p gff {}".format(target_fname)
-    try:
-        return_code = subprocess.check_call(cmd_line, shell=True)
-    except subprocess.CalledProcessError as cpe:
-        log_print("Unsuccessful. Got return code {}".format(cpe.returncode))
-    else:
-        log_print("Successfully indexed block-gzipped file {}".format(target_fname))
+    indexed_fpath = Path(pysam.tabix_index(str(target_fpath), preset="gff", force=True))
+    logger.info("Indexed %s", indexed_fpath)
+    return indexed_fpath
 
 
 def pretty_now():
