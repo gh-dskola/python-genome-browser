@@ -73,6 +73,8 @@ These breaking changes ship as 0.4.0.
 - Messages go through `logging.getLogger(__name__)` instead of `print`.
 - Type hints and numpy-style docstrings on the public API; the coordinate convention is
   stated in the `datasources` module docstring.
+- Docs: `README.md` (installation, quick start, coordinates, formats table, testing),
+  `TODO.md` (done items pruned), `CLAUDE.md`.
 - Demo notebook: `from imp import reload` → `from importlib import reload` (`imp` is gone
   in Python 3.12).
 

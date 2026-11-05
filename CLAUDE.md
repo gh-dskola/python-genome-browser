@@ -45,3 +45,11 @@ file from outside the repo.
 - ruff with `C901` at `max-complexity = 10`.
 - Update `CHANGELOG.md` (`## Unreleased`) with every change. Breaking changes need a
   `### Breaking changes` entry with a *Migration:* note (see `CONTRIBUTING.md`).
+
+## Gotchas
+
+- `python -m pytest` puts the current directory first on `sys.path`, so run from the repo
+  root it always imports the working-tree package. To test an old checkout, run pytest
+  from another directory with `PYTHONPATH` pointing at that checkout.
+- `pygbrowse.__version__` comes from git tags via setuptools-scm; without an installed
+  package (plain `PYTHONPATH=.`) it reads `0.0.0.dev0`.

@@ -12,6 +12,74 @@ The python genome browser, AKA pygbrowse, makes it easy to generate aligned plot
 1. Visualizing data inside a Jupyter notebook.
 2. Preparing figures for presentation or publication.
 
+## Installation
+
+```bash
+git clone https://github.com/guardant/python-genome-browser.git
+cd python-genome-browser
+mamba env create -f environment.yaml   # creates the `pygbrowse` env and installs the package
+mamba activate pygbrowse
+```
+
+Requires Python 3.10 or later. `pip install -e .` inside any environment with the
+dependencies in `pyproject.toml` also works.
+
+## Quick start
+
+```python
+from pygbrowse import datasources, plots, utilities
+
+# Gene models need a sorted, bgzipped, tabix-indexed GFF3 (Ensembl layout).
+utilities.bgzip_gff("Mus_musculus.GRCm38.93.chr.gff3.gz", "genes.gff3.bgz")
+utilities.generate_tabix_index("genes.gff3.bgz")
+
+genes = plots.GeneModelPlot(data=datasources.Gff3Annotations("genes.gff3.bgz"))
+signal = plots.WigPlot(data=datasources.BigWigDataSource("signal.bw"), label="ChIP-seq")
+peaks = plots.BedPlot(data=datasources.IntervalData("peaks.bed"), label="Peaks")
+
+browser = plots.GenomeBrowser([[signal], [peaks], [genes]])
+fig = browser.visualize("chr4", 62494071, 62546083)
+fig.savefig("region.png", dpi=300, bbox_inches="tight")
+```
+
+Each inner list is one row; tracks in the same row share an Axes. `visualize` returns a
+new `matplotlib.figure.Figure` and leaves matplotlib's global settings unchanged. Pass
+`style={...}` (rcParams) to change the look of one figure. To see progress messages,
+call `logging.basicConfig(level=logging.INFO)`.
+
+## Coordinates and chromosome names
+
+- Every `query(chrom, start, end)` and every `visualize(chrom, start, end)` window is
+  **0-based, half-open** (`[start, end)`), as in BED.
+- Query chromosomes are UCSC style (`chr1`, `chrX`, `chrM`). Sources convert to the file's
+  naming: `Gff3Annotations` expects Ensembl contigs (`1`, `X`, `MT`) by default, and
+  `BigWigDataSource(chromosome_dialect=...)` accepts `ucsc`, `ensembl` or `yeast`.
+- 1-based formats are converted on read: GFF3 (1-based, closed) in `Gff3Annotations`, HOMER
+  tag files (1-based starts) in `TagDirectory`.
+
+## Supported formats
+
+| Data | Source class | Track class |
+|---|---|---|
+| Gene models: GFF3, bgzipped + tabix-indexed | `Gff3Annotations` | `GeneModelPlot` |
+| Signal: BigWig | `BigWigDataSource` | `WigPlot` |
+| Signal: HOMER tag directory | `TagDirectory` | `WigPlot` |
+| Signal: in-memory `pandas.Series` per chromosome | `SparseVectors` | `WigPlot` |
+| Intervals: BED (3+ columns), HOMER peaks, HOMER annotated peaks, DataFrame | `IntervalData` | `BedPlot` |
+| Pairwise interactions: DataFrame with `chr1, start1, end1, start2, end2` | (the DataFrame) | `InteractionPlot` |
+| Hi-C matrices: per-chromosome TSV files or in-memory DataFrames | `HicDataDir`, `HicDataDict` | `HicPlot` |
+
+## Testing
+
+```bash
+mamba activate pygbrowse
+ruff check pygbrowse tests
+python -m pytest tests/
+```
+
+The tests build all their data (GFF3, BigWig, HOMER tag directory, BED) in a temporary
+directory. See [CONTRIBUTING.md](CONTRIBUTING.md) for the changelog and versioning rules.
+
 ## Why not just use those tools you just mentioned?
 
 For a couple of reasons:
